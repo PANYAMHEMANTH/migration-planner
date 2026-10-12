@@ -14,6 +14,7 @@ import time
 import os
 import subprocess
 import sys
+import urllib.parse
 
 from util.connectors import TokenManager, UrlInvoker
 from util.monitoring import ResourceMonitor
@@ -3090,7 +3091,10 @@ class MigrationEstimatorTool(ctk.CTk):
       s = manager.get_session()
       h = {"Authorization": f"Bearer {t}", "ConsistencyLevel": "eventual"}
       try:
-        cln = email.replace("'", "''")
+        # Escape single quotes for OData, then URL-encode the value so
+        # characters like '#' (e.g. guest '#EXT#' UPNs) and '+' are sent
+        # to Graph intact instead of being treated as URL syntax.
+        cln = urllib.parse.quote(email.replace("'", "''"), safe="")
         if custom_url_provided:
           target_urls = [url.format(GRAPH_BASE_URL=GRAPH_BASE_URL, cln=cln)]
         else:
@@ -3115,7 +3119,7 @@ class MigrationEstimatorTool(ctk.CTk):
               if r.status_code == 200:
                 lookup_error = None
               else:
-                lookup_error = f"HTTP {r.status_code}: {r.text[:200]}"
+                lookup_error = f"HTTP {r.status_code}: {r.text}"
               break
             except Exception as error:
               lookup_error = f"{type(error).__name__}: {error}"
