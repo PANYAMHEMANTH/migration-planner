@@ -14,6 +14,7 @@ import time
 import os
 import subprocess
 import sys
+import urllib.parse
 
 from util.connectors import TokenManager, UrlInvoker
 from util.monitoring import ResourceMonitor
@@ -1711,7 +1712,7 @@ class MigrationEstimatorTool(ctk.CTk):
               "{GRAPH_BASE_URL}/groups?$filter=mail eq"
               " '{cln}'&$select=id,mail"
           )
-          groups = self._resolve_from_csv(manager, groups_to_resolve, url)
+          groups = self._resolve_from_csv(manager, groups_to_resolve, url, entity_label="group")
         else:
           groups = [{"id": None, "mail": row} for row in groups_to_resolve]
       else:
@@ -3054,6 +3055,10 @@ class MigrationEstimatorTool(ctk.CTk):
 
         r = session.get(url, headers=headers, timeout=60)
         if r.status_code != 200:
+          self.log_msg(
+              f"[ERROR] Fetching tenant users failed with HTTP {r.status_code}:"
+              f" {r.text[:200]}. Only {len(users)} user(s) were fetched."
+          )
           break
         d = r.json()
         users.extend(d.get("value", []))
@@ -3065,7 +3070,7 @@ class MigrationEstimatorTool(ctk.CTk):
       manager.return_token_slot(token_data)
     return users
 
-  def _resolve_from_csv(self, manager, emails, url = None):
+  def _resolve_from_csv(self, manager, emails, url = None, entity_label = "user"):
     if not emails:
       return []
     resolved = []
@@ -3076,14 +3081,20 @@ class MigrationEstimatorTool(ctk.CTk):
             )
 
     def resolve_one(email):
+      # Returns (match, errors). errors is None if the entry was not
+      # attempted because the scan was stopped.
       if self.stop_scan_event.is_set():
-        return None
+        return None, None
+      errors = []
       token_data = manager.get_valid_token_slot(self.log_msg)
       t = token_data["token"]
       s = manager.get_session()
       h = {"Authorization": f"Bearer {t}", "ConsistencyLevel": "eventual"}
       try:
-        cln = email.replace("'", "''")
+        # Escape single quotes for OData, then URL-encode the value so
+        # characters like '#' (e.g. guest '#EXT#' UPNs) and '+' are sent
+        # to Graph intact instead of being treated as URL syntax.
+        cln = urllib.parse.quote(email.replace("'", "''"), safe="")
         if custom_url_provided:
           target_urls = [url.format(GRAPH_BASE_URL=GRAPH_BASE_URL, cln=cln)]
         else:
@@ -3093,36 +3104,72 @@ class MigrationEstimatorTool(ctk.CTk):
               f"{GRAPH_BASE_URL}/users?$filter=proxyAddresses/any(c:c eq 'smtp:{cln}')&$select=id,userPrincipalName"
           ]
         for u in target_urls:
+          lookup_error = None
           for attempt in range(3):
             if self.stop_scan_event.is_set():
-              return None
+              return None, None
             try:
               r = s.get(u, headers=h, timeout=60)
               if r.status_code in (429, 503):
+                lookup_error = f"HTTP {r.status_code} after 3 attempts"
                 time.sleep(1 << attempt)
                 continue
               if r.status_code == 200 and r.json().get("value"):
-                return r.json()["value"][0]
+                return r.json()["value"][0], errors
+              if r.status_code == 200:
+                lookup_error = None
+              else:
+                lookup_error = f"HTTP {r.status_code}: {r.text}"
               break
-            except Exception:
+            except Exception as error:
+              lookup_error = f"{type(error).__name__}: {error}"
               if attempt < 2:
                 time.sleep(1 << attempt)
-      except Exception:
-        pass
+          if lookup_error:
+            errors.append(f"{u} -> {lookup_error}")
+      except Exception as error:
+        errors.append(f"{type(error).__name__}: {error}")
       finally:
         manager.return_token_slot(token_data)
+      return None, errors
 
+    processed_count = 0
+    not_attempted_count = 0
     with ThreadPoolExecutor(max_workers=min(50, len(emails))) as exc:
-      futures = [exc.submit(resolve_one, e) for e in emails]
+      futures = {exc.submit(resolve_one, e): e for e in emails}
       for f in as_completed(futures):
         if self.stop_scan_event.is_set():
           break
-        res = f.result()
+        email = futures[f]
+        processed_count += 1
+        try:
+          res, errors = f.result()
+        except Exception as error:
+          res, errors = None, [f"{type(error).__name__}: {error}"]
         if res:
           resolved.append(res)
           self.ui_update(
               "user_discovery", count=len(resolved), status="Resolving CSV..."
           )
+        elif errors is None:
+          not_attempted_count += 1
+        elif errors:
+          self.log_msg(
+              f"[ERROR] Could not resolve {entity_label} '{email}'. Skipped."
+              f" Errors: {' | '.join(errors)}"
+          )
+        else:
+          self.log_msg(
+              f"[WARNING] {entity_label.capitalize()} '{email}' was not found"
+              " in the tenant. Skipped."
+          )
+
+    not_attempted_count += len(emails) - processed_count
+    if not_attempted_count:
+      self.log_msg(
+          f"[WARNING] Scan stopped: {not_attempted_count} {entity_label}(s)"
+          " from the CSV were not resolved."
+      )
     return resolved
 
 if __name__ == "__main__":
