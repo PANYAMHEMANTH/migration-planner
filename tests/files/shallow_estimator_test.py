@@ -51,7 +51,6 @@ TENANT = "https://contoso.sharepoint.com"
 MY_TENANT = "https://contoso-my.sharepoint.com"
 
 LARGE_LIMIT = 500
-WARNING_LIMIT = 200
 
 
 def build_config(**overrides):
@@ -67,7 +66,6 @@ def build_config(**overrides):
       "backoff": 1,
       "parallel_batches": 5,
       "large_resource_count_limit": LARGE_LIMIT,
-      "warning_resource_count_limit": WARNING_LIMIT,
       "max_allowed_depth": 3,
   }
   params.update(overrides)
@@ -615,7 +613,7 @@ class ShallowScanAggregationTest(ShallowScanBaseTest):
     self.assertEqual(drive_metrics[d2]["folderCount"], 5)
 
   def test_threshold_levels(self):
-    """Verify Large and Warning fire at DL, Subsite and Site with right parents."""
+    """Verify Large fires at DL, Subsite and Site with right parents."""
     root = self.register_site("siteA", f"{TENANT}/sites/Finance")
     sub = self.register_site("siteA_hr", f"{TENANT}/sites/Finance/HR")
     d1 = self.register_library(
@@ -630,8 +628,6 @@ class ShallowScanAggregationTest(ShallowScanBaseTest):
 
     large = {(r["type"], r["id"], r["parent"])
              for r in out["metrics"]["tenantLevelLargeResources"]}
-    warning = {(r["type"], r["id"], r["parent"])
-               for r in out["metrics"]["tenantLevelWarningResources"]}
     expected = {
         (ResourceType.DL.value, d1, sub),
         (ResourceType.SUBSITE.value, sub, root),
@@ -639,9 +635,10 @@ class ShallowScanAggregationTest(ShallowScanBaseTest):
     }
 
     self.assertEqual(large, expected)
-    self.assertEqual(warning, expected)
     self.assertEqual(out["metrics"]["siteMetrics"][root]["largeResourceCount"], 3)
     self.assertEqual(out["metrics"]["tenantLevelLargeResourceCount"], 3)
+    self.assertNotIn("tenantLevelWarningResources", out["metrics"])
+    self.assertNotIn("warningResourceCount", out["metrics"]["siteMetrics"][root])
 
   def test_no_subsite_entry_for_top_level_owned_library(self):
     """Verify a root-owned library emits DL and SITE but never SUBSITE."""
@@ -651,10 +648,10 @@ class ShallowScanAggregationTest(ShallowScanBaseTest):
 
     out = self.run_scan(
         metrics, {site: [d1]}, {},
-        {d1: {"item": WARNING_LIMIT + 1, "files": 1, "size": 10}},
+        {d1: {"item": LARGE_LIMIT + 1, "files": 1, "size": 10}},
     )
 
-    types = [r["type"] for r in out["metrics"]["tenantLevelWarningResources"]]
+    types = [r["type"] for r in out["metrics"]["tenantLevelLargeResources"]]
     self.assertIn(ResourceType.DL.value, types)
     self.assertIn(ResourceType.SITE.value, types)
     self.assertNotIn(ResourceType.SUBSITE.value, types)
@@ -662,10 +659,10 @@ class ShallowScanAggregationTest(ShallowScanBaseTest):
   def test_threshold_boundary_is_strict(self):
     """Verify a count exactly at the limit does not breach."""
     cases = [
-        ("exactly_at_warning", WARNING_LIMIT, 0),
-        ("one_over_warning", WARNING_LIMIT + 1, 2),
+        ("exactly_at_large", LARGE_LIMIT, 0),
+        ("one_over_large", LARGE_LIMIT + 1, 2),
     ]
-    for name, item_count, expected_warnings in cases:
+    for name, item_count, expected_large in cases:
       with self.subTest(case=name):
         self.setUp()
         site = self.register_site("siteA", f"{TENANT}/sites/Finance")
@@ -680,8 +677,8 @@ class ShallowScanAggregationTest(ShallowScanBaseTest):
         )
 
         self.assertEqual(
-            out["metrics"]["tenantLevelWarningResourceCount"],
-            expected_warnings,
+            out["metrics"]["tenantLevelLargeResourceCount"],
+            expected_large,
         )
 
   def test_tenant_totals_equal_sum_of_sites(self):
@@ -854,7 +851,7 @@ class ShallowScanFailureTest(ShallowScanBaseTest):
     self.assertEqual(site_metrics["totalSize"], 0)
     self.assertNotIn(d1, out["metrics"]["driveMetrics"])
     self.assertEqual(out["failed"], 1)
-    self.assertEqual(out["metrics"]["tenantLevelWarningResourceCount"], 0)
+    self.assertEqual(out["metrics"]["tenantLevelLargeResourceCount"], 0)
 
   def test_failed_library_does_not_affect_siblings(self):
     """Verify one bad library leaves the rest of the site intact."""
@@ -1259,9 +1256,9 @@ class ShallowScanReportCsvUploadTest(unittest.TestCase):
     csv_content = (
         "Site URL/Name,Subsite Count,DL Count,Failed DL Count,List Count,Folder Count,File Count,"
         "Shortcut Count,Folder Count > Depth Limit 100,File Count > Depth Limit 100,"
-        "Entities with > 500k item count,Entities with > 200k item count,Corpus Size,Suggested Batch\n"
-        "https://smh3v-my.sharepoint.com/personal/bugbash5_smh3v_onmicrosoft_com,0,3,1,4,2,99997,N/A,N/A,N/A,0,0,73.24 MB,Batch 1\n"
-        "https://smh3v.sharepoint.com/sites/marketing,1,5,2,6,200,17540,N/A,N/A,N/A,0,0,540.93 GB,Batch 2\n"
+        "Entities with > 500k item count,Corpus Size,Suggested Batch\n"
+        "https://smh3v-my.sharepoint.com/personal/bugbash5_smh3v_onmicrosoft_com,0,3,1,4,2,99997,N/A,N/A,N/A,0,73.24 MB,Batch 1\n"
+        "https://smh3v.sharepoint.com/sites/marketing,1,5,2,6,200,17540,N/A,N/A,N/A,0,540.93 GB,Batch 2\n"
     )
     with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, encoding="utf-8") as tmp:
       tmp.write(csv_content)
@@ -1290,6 +1287,58 @@ class ShallowScanReportCsvUploadTest(unittest.TestCase):
     finally:
       if os.path.exists(tmp_path):
         os.remove(tmp_path)
+
+
+class ShallowDeepScanRecommendedTest(unittest.TestCase):
+  """Verifies only sites with >500k-item entities are marked 'Deep Scan Recommended'."""
+
+  def _make_tool(self):
+    import pandas as pd
+
+    tool = mock.Mock()
+    tool.val_shallow_scan = True
+    tool.calculate_migration_batches.side_effect = (
+        lambda df, _lm: (df.assign(**{"Suggested Batch": "Batch 1"}), [], 0.0, [])
+    )
+    return tool, pd
+
+  def test_only_large_resource_sites_are_excluded(self):
+    """A site with a >500k entity is excluded; a 300k-item site is planned normally."""
+    from ui.files_shallow import shallow_ui_helpers
+
+    tool, pd = self._make_tool()
+    df = pd.DataFrame([
+        {"Site Id": "large", "File Count": 600000, "Entities with > 500k item count": 2},
+        {"Site Id": "mid", "File Count": 300000, "Entities with > 500k item count": 0},
+        {"Site Id": "small", "File Count": 100, "Entities with > 500k item count": 0},
+    ])
+
+    df_final, _, _, _ = shallow_ui_helpers.calculate_batches_with_shallow_exclusions(
+        tool, df, {}
+    )
+
+    batches = dict(zip(df_final["Site Id"], df_final["Suggested Batch"]))
+    self.assertEqual(batches["large"], "Deep Scan Recommended")
+    self.assertEqual(batches["mid"], "Batch 1")
+    self.assertEqual(batches["small"], "Batch 1")
+    planned_df = tool.calculate_migration_batches.call_args[0][0]
+    self.assertEqual(sorted(planned_df["Site Id"]), ["mid", "small"])
+
+  def test_legacy_200k_column_is_ignored(self):
+    """A legacy '>200k' column no longer triggers exclusion."""
+    from ui.files_shallow import shallow_ui_helpers
+
+    tool, pd = self._make_tool()
+    df = pd.DataFrame([
+        {"Site Id": "mid", "Entities with > 500k item count": 0,
+         "Entities with > 200k item count": 3},
+    ])
+
+    df_final, _, _, _ = shallow_ui_helpers.calculate_batches_with_shallow_exclusions(
+        tool, df, {}
+    )
+
+    self.assertEqual(df_final["Suggested Batch"].iloc[0], "Batch 1")
 
 
 class ShallowFailedDlTrackingTest(ShallowScanBaseTest):

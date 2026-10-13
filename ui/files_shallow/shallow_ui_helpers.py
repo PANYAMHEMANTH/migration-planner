@@ -576,7 +576,7 @@ def run_certificate_auth_check(tool, config, ctk) -> bool:
 
 
 def calculate_batches_with_shallow_exclusions(tool, df: pd.DataFrame, license_metrics: dict):
-  """Excludes sites with >200k items from ETA calculation during Shallow Scan.
+  """Excludes sites with >500k items from ETA calculation during Shallow Scan.
 
   Marks excluded sites with Suggested Batch = 'Deep Scan Recommended' so they
   are natively exported to outputs/<ts>/suggested_batches/DeepScanRecommended.csv.
@@ -584,19 +584,19 @@ def calculate_batches_with_shallow_exclusions(tool, df: pd.DataFrame, license_me
   if not getattr(tool, "val_shallow_scan", False):
     return tool.calculate_migration_batches(df, license_metrics)
 
-  warn_col = "Entities with > 200k item count"
-  if warn_col not in df.columns:
-    numeric_warn = pd.Series([0] * len(df), index=df.index)
+  large_col = "Entities with > 500k item count"
+  if large_col not in df.columns:
+    numeric_large = pd.Series([0] * len(df), index=df.index)
   else:
-    numeric_warn = pd.to_numeric(df[warn_col], errors="coerce").fillna(0)
+    numeric_large = pd.to_numeric(df[large_col], errors="coerce").fillna(0)
 
-  df_eligible = df[numeric_warn == 0].copy()
-  df_excluded = df[numeric_warn > 0].copy()
+  df_eligible = df[numeric_large == 0].copy()
+  df_excluded = df[numeric_large > 0].copy()
 
   if not df_excluded.empty:
     df_excluded["Suggested Batch"] = "Deep Scan Recommended"
     tool.log_msg(
-        f"[Shallow Scan] Excluding {len(df_excluded)} site(s) with >200k items "
+        f"[Shallow Scan] Excluding {len(df_excluded)} site(s) with >500k items "
         "from ETA calculation (marked as 'Deep Scan Recommended')."
     )
 
