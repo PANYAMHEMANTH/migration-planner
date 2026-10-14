@@ -419,7 +419,7 @@ def generate_data(
                     for sub_item in metrics["items"]:
                         if "folder" in sub_item and sub_item["id"] != item_id: # Skip root
                             f_metrics = folder_to_metrics.get(sub_item["id"])
-                            if f_metrics and f_metrics["subTreeCount"] >= 50: # Using limit 50
+                            if f_metrics and f_metrics["subTreeCount"] > 50: # Using limit 50
                                 drive_metrics["largeResources"].append({
                                     "type": "FOLDER",
                                     "id": sub_item["id"],

@@ -106,8 +106,6 @@ class ShallowFileEstimator(FileEstimator):
         "tenantLevelFileSizeDistribution": {"buckets": []},
         "tenantLevelLargeResources": [],
         "tenantLevelLargeResourceCount": 0,
-        "tenantLevelWarningResources": [],
-        "tenantLevelWarningResourceCount": 0,
     }
 
   def _prepare_root_sites(self, metrics: Dict[str, Any]) -> None:
@@ -129,7 +127,6 @@ class ShallowFileEstimator(FileEstimator):
       s_data["folderCountExceedingDepthLimit"] = "N/A"
       s_data["fileCountExceedingDepthLimit"] = "N/A"
       s_data.setdefault("largeResourceCount", 0)
-      s_data.setdefault("warningResourceCount", 0)
       s_data.setdefault("totalSize", 0)
       s_data.setdefault("resourceCount", 0)
 
@@ -216,7 +213,7 @@ class ShallowFileEstimator(FileEstimator):
       item_count: int,
       parent_id: str,
   ) -> None:
-    """Records Large (>500k) and Warning (>200k) breaches for one resource.
+    """Records Large (>500k) breaches for one resource.
 
     Counters are always incremented on the owning root site collection so the
     site report aggregates identically to Deep Scan.
@@ -229,16 +226,6 @@ class ShallowFileEstimator(FileEstimator):
           "subTreeCount": item_count,
           "parent": parent_id,
           "Limit": self.config.large_resource_count_limit,
-      })
-
-    if item_count > self.config.warning_resource_count_limit:
-      s_meta["warningResourceCount"] += 1
-      metrics["tenantLevelWarningResources"].append({
-          "type": resource_type,
-          "id": resource_id,
-          "subTreeCount": item_count,
-          "parent": parent_id,
-          "Limit": self.config.warning_resource_count_limit,
       })
 
   def _evaluate_container_thresholds(
@@ -471,9 +458,6 @@ class ShallowFileEstimator(FileEstimator):
     )
     metrics["tenantLevelLargeResourceCount"] = len(
         metrics["tenantLevelLargeResources"]
-    )
-    metrics["tenantLevelWarningResourceCount"] = len(
-        metrics["tenantLevelWarningResources"]
     )
     metrics["siteClassification"] = {
         site_id: "personal" if self._is_subsite_personal(site_id) else "teams"

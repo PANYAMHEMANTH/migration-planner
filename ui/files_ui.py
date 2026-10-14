@@ -472,7 +472,6 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
         "Folder Count > Depth Limit 100",
         "File Count > Depth Limit 100",
         "Entities with > 500k item count",
-        "Entities with > 200k item count",
         "Corpus Size",
     }
     id_col = "Site URL/Name" if "Site URL/Name" in df.columns else ("Site Id" if "Site Id" in df.columns else ("Entity" if "Entity" in df.columns else None))
@@ -562,7 +561,6 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
               else _safe_int(row.get("File Count > Depth Limit 100", 0))
           ),
           "largeResourceCount": _safe_int(row.get("Entities with > 500k item count", 0)),
-          "warningResourceCount": _safe_int(row.get("Entities with > 200k item count", 0)),
           "totalSize": _parse_size_str(row.get("Corpus Size", 0)),
           "resourceCount": res_cnt,
       }
@@ -600,12 +598,10 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
             else int(pd.to_numeric(df.get("File Count > Depth Limit 100", pd.Series([0])), errors="coerce").fillna(0).sum())
         ),
         "tenantLevelLargeResourceCount": int(pd.to_numeric(df.get("Entities with > 500k item count", pd.Series([0])), errors="coerce").fillna(0).sum()),
-        "tenantLevelWarningResourceCount": int(pd.to_numeric(df.get("Entities with > 200k item count", pd.Series([0])), errors="coerce").fillna(0).sum()),
         "siteClassification": {site_id: "personal" if "/personal/" in site_id.lower() else "teams" for site_id in site_metrics.keys()},
         "licenseMetrics": {},
         "tenantLevelFileSizeDistribution": {},
         "tenantLevelLargeResources": [],
-        "tenantLevelWarningResources": [],
     }
 
   def _get_input_from_csv_if_uploaded(self, config):
@@ -675,8 +671,7 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
         "fileCount": "File Count",
         "folderCountExceedingDepthLimit": "Folder Count > Depth Limit",
         "fileCountExceedingDepthLimit": "File Count > Depth Limit",
-        "tenantLevelLargeResourceCount": "Tenant Level Large Resource Count",
-        "tenantLevelWarningResourceCount": "Tenant Level Warning Resource Count"
+        "tenantLevelLargeResourceCount": "Tenant Level Large Resource Count"
       }
 
       self.id_to_display_name = id_to_display
@@ -775,7 +770,6 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
             "Folder Count > Depth Limit 100": s_data.get("folderCountExceedingDepthLimit", 0),
             "File Count > Depth Limit 100": s_data.get("fileCountExceedingDepthLimit", 0),
             "Entities with > 500k item count": s_data.get("largeResourceCount", 0),
-            "Entities with > 200k item count": s_data.get("warningResourceCount", 0),
             "Corpus Size": s_data.get("totalSize", 0),
             "Resource Count": s_data.get("resourceCount", 0),
         })
@@ -805,9 +799,9 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
         file_metrics["df"] = df_final
         base_df = df_final
       else:
-        if getattr(self, "val_shallow_scan", False) and "Entities with > 200k item count" in df.columns:
-          numeric_warn = pd.to_numeric(df["Entities with > 200k item count"], errors="coerce").fillna(0)
-          df["Suggested Batch"] = numeric_warn.apply(lambda v: "Deep Scan Recommended" if v > 0 else "")
+        if getattr(self, "val_shallow_scan", False) and "Entities with > 500k item count" in df.columns:
+          numeric_large = pd.to_numeric(df["Entities with > 500k item count"], errors="coerce").fillna(0)
+          df["Suggested Batch"] = numeric_large.apply(lambda v: "Deep Scan Recommended" if v > 0 else "")
         base_df = df
 
       t_plan_gen_end = time.time()
@@ -1342,12 +1336,12 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
               text_color=COLOR_TEXT_MAIN,
           ).pack(anchor="w", padx=10, pady=(0, 10))
 
-      if data.get("isShallowScan") and data.get("tenantLevelWarningResourceCount", 0) > 0:
-          warning_entity_count = data.get("tenantLevelWarningResourceCount", 0)
-          entity_label = "entity contains" if warning_entity_count == 1 else "entities contain"
+      if data.get("isShallowScan") and data.get("tenantLevelLargeResourceCount", 0) > 0:
+          large_entity_count = data.get("tenantLevelLargeResourceCount", 0)
+          entity_label = "entity contains" if large_entity_count == 1 else "entities contain"
           rec_text = (
-              f"⚠️ {warning_entity_count:,} {entity_label} items >200k. Sites containing these entities were excluded from ETA calculations.\n"
-              "Recommendation: Run a Deep Scan with 'Generate Folder Depth Report' enabled on these resources using the exported 'DeepScanRecommended.csv' in suggested_batches."
+              f"⚠️ {large_entity_count:,} {entity_label} items >500k. Sites containing these entities were excluded from ETA calculations.\n"
+              "Recommendation: Run a Deep Scan with 'Generate Depth Report for Large Resources' enabled on these resources using the exported 'DeepScanRecommended.csv' in suggested_batches."
           )
           ctk.CTkLabel(
               self.view_results,
@@ -1400,7 +1394,6 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
       self.create_stat_card(card_frame, "Folder count beyond\ndepth limit 100", shallow_ui_helpers.format_stat_value(data.get('folderCountExceedingDepthLimit', 0)), "📁")
       self.create_stat_card(card_frame, "File count beyond\ndepth limit 100", shallow_ui_helpers.format_stat_value(data.get('fileCountExceedingDepthLimit', 0)), "📄")
       self.create_stat_card(card_frame, "Large Resource Count\n(Entities with >500k items)", f"{data.get('tenantLevelLargeResourceCount', 0):,}", "📄")
-      self.create_stat_card(card_frame, "Warning Resource Count\n(Entities with >200k items)", f"{data.get('tenantLevelWarningResourceCount', 0):,}", "⚠️")
 
       if self.show_eta:
         # Timeline
@@ -1675,7 +1668,6 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
         "Folder Count > Depth Limit 100",
         "File Count > Depth Limit 100",
         "Entities with > 500k item count",
-        "Entities with > 200k item count",
         "Corpus Size",
     }
     is_report_csv = "Entity" in df.columns and report_cols.issubset(df.columns)
@@ -1829,7 +1821,6 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
           ("Folder count beyond depth limit 100", data.get("folderCountExceedingDepthLimit", 0)),
           ("File count beyond depth limit 100", data.get("fileCountExceedingDepthLimit", 0)),
           ("Large Resource Count (Entities with >500k items)", data.get("tenantLevelLargeResourceCount", 0)),
-          ("Warning Resource Count (Entities with >200k items)", data.get("tenantLevelWarningResourceCount", 0)),
           ("Total Scan Runtime", data.get("total_runtime", "N/A"))
       ])
       
@@ -1877,35 +1868,15 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
         ])
         
         writer.writerow([]) # Blank line separator
-      
-      # Section 5: Warning Resources
-      if len(data.get("tenantLevelWarningResources", [])) > 0:
-        weights = {
-          "SITE COLLECTION": 1,
-          "SUBSITE": 2,
-          "DOCUMENT LIBRARY": 3,
-          "FOLDER": 4
-        }
-        sorted_warning_resources = sorted(data.get("tenantLevelWarningResources", []), key=lambda x: weights.get(x.get("Type", x.get("type", "")), 0), reverse=False)
-        writer.writerow(["Warning Resources (Entities with >200k items)", ""])
-        writer.writerow(["Type", "URL", "Item Count"])
-        for res in sorted_warning_resources:
-          writer.writerow([
-            res.get("Type", res.get("type", "")),
-            self._get_display_name(res.get("Id", res.get("id", ""))),
-            res.get("subTreeCount", 0)
-        ])
-        
-        writer.writerow([]) # Blank line separator
 
       if len(data.get("siteMetrics", {}).items()) > 0:
-        # Section 6: Site Details
+        # Section 5: Site Details
         writer.writerow(["Site Details", ""])
         dl_cols = ["DL Count", "Failed DL Count"] if is_shallow_export else ["DL Count"]
         if "siteIdToMail" not in data:
-          row = ["Site Collection", "Subsite Count"] + dl_cols + ["List Count", "Folder Count", "File Count", "Shortcut Count", "Folder Count > Depth Limit 100", "File Count > Depth Limit 100", "Entities with > 500k item count", "Entities with > 200k item count", "Corpus Size"]
+          row = ["Site Collection", "Subsite Count"] + dl_cols + ["List Count", "Folder Count", "File Count", "Shortcut Count", "Folder Count > Depth Limit 100", "File Count > Depth Limit 100", "Entities with > 500k item count", "Corpus Size"]
         else:
-          row = ["Site Collection", "Email Id", "Subsite Count"] + dl_cols + ["List Count", "Folder Count", "File Count", "Shortcut Count", "Folder Count > Depth Limit 100", "File Count > Depth Limit 100", "Entities with > 500k item count", "Entities with > 200k item count", "Corpus Size"]
+          row = ["Site Collection", "Email Id", "Subsite Count"] + dl_cols + ["List Count", "Folder Count", "File Count", "Shortcut Count", "Folder Count > Depth Limit 100", "File Count > Depth Limit 100", "Entities with > 500k item count", "Corpus Size"]
 
         if getattr(self, "val_include_recycle_bin_contents", False):
           row.extend(["Recycle Bin Item Count", "Recycle Bin Size"])
@@ -1969,7 +1940,6 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
                   s_data.get("folderCountExceedingDepthLimit", 0),
                   s_data.get("fileCountExceedingDepthLimit", 0),
                   s_data.get("largeResourceCount", 0),
-                  s_data.get("warningResourceCount", 0),
                   self.format_size(s_data.get("totalSize", 0))
               ]
               if getattr(self, "val_include_recycle_bin_contents", False):
@@ -1990,7 +1960,6 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
                 s_data.get("folderCountExceedingDepthLimit", 0),
                 s_data.get("fileCountExceedingDepthLimit", 0),
                 s_data.get("largeResourceCount", 0),
-                s_data.get("warningResourceCount", 0),
                 self.format_size(s_data.get("totalSize", 0))
             ]
             if getattr(self, "val_include_recycle_bin_contents", False):
