@@ -249,7 +249,15 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
     ui_utils.build_concurrency_settings_slider(self, ctk, useConcurrencyHeading=True)
 
     # Migration Plan Options
-    ui_utils.build_migration_plan_options(self, ctk, max_parallel_batches=5)
+    ui_utils.build_migration_plan_options(
+        self,
+        ctk,
+        max_parallel_batches=7,
+        parallel_batches_disclaimer=(
+            "* 6 parallel batches are only supported for 15k+ licenses; "
+            "7 parallel batches are only supported for 50k+ licenses."
+        ),
+    )
 
   def update_progress(self, msg):
     if isinstance(msg, str):

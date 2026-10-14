@@ -207,7 +207,7 @@ def build_concurrency_settings_slider(self, ctk, useConcurrencyHeading=False):
         concurrency_frame, 1, 0, "Load Multiplier:", self.load_multiplier
     )
 
-def build_migration_plan_options(self, ctk, max_parallel_batches):
+def build_migration_plan_options(self, ctk, max_parallel_batches, parallel_batches_disclaimer=None):
   ctk.CTkLabel(
     self.adv_frame,
     text="Migration Plan Options",
@@ -243,7 +243,16 @@ def build_migration_plan_options(self, ctk, max_parallel_batches):
       ),
       font=FONT_BODY_SMALL,
       text_color=COLOR_TEXT_SUB,
-  ).pack(anchor="w", padx=25, pady=(2, 15))
+  ).pack(anchor="w", padx=25, pady=(2, 0 if parallel_batches_disclaimer else 15))
+
+  if parallel_batches_disclaimer:
+    ctk.CTkLabel(
+        self.adv_frame,
+        text=parallel_batches_disclaimer,
+        font=FONT_BODY_SMALL,
+        text_color=COLOR_TEXT_SUB,
+        justify="left",
+    ).pack(anchor="w", padx=25, pady=(2, 15))
 
 def build_advanced_settings_frame(self, ctk):
   self.adv_frame = ctk.CTkFrame(
