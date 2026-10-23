@@ -10,6 +10,7 @@
   - **Automated Deep Scan Recommendations**: Sites containing an entity (Site, Subsite, or Document Library) exceeding **500k items** (Large Resources) are marked as `"Deep Scan Recommended"` in the `Suggested Batch` column, excluded from ETA calculations, and exported to `suggested_batches/DeepScanRecommended.csv` for targeted Deep Scans.
   - **Failed Document Library Tracking**: Surfaces a **Failed Document Library Count** card on the results dashboard and a `Failed DL Count` column in exported CSV reports if any Document Library fails to scan.
   - **Site Report CSV Upload for Instant ETA Recalculation**: Upload a previously generated `site_report_<timestamp>.csv` (from either Shallow Scan or Deep Scan, covering both OneDrive and SharePoint sites) via **Upload CSV** to recalculate migration batches and ETAs without re-scanning.
+  - **File Version Estimates in Shallow Scan**: With *Include Historical File Versions* ticked, Shallow Scan estimates the migratable corpus including versions (up to 180 per file) from SharePoint storage metrics, with no extra API calls, and uses it for the ETA.
   - **Note**: The new feature requires an additional library `cryptography`. Please run `pip install cryptography` or `pip3 install cryptography` if faced with errors like `ModuleNotFoundError: No module named 'cryptography'`
 
 ## DISCLAIMER
@@ -278,7 +279,11 @@ Click **"Show Advanced Settings"** to configure your scan mode:
 *   **Shallow Scan (Enabled by Default)**:
     *   The **Shallow Scan** toggle at the top of Advanced Settings is switched **ON** by default.
     *   Shallow Scan rapidly retrieves total folder counts, file counts, and active corpus sizes per Document Library without enumerating individual folder/file trees.
-    *   While **Shallow Scan** is ON, Deep Scan-specific checkboxes (*Include Recycle Bin Contents*, *Include Historical File Versions*, *Scan for Encrypted Files (RMS/MIP)*, and *Generate Depth Report for Large Resources*) are inactive/disabled.
+    *   While **Shallow Scan** is ON, Deep Scan-specific checkboxes (*Include Recycle Bin Contents*, *Scan for Encrypted Files (RMS/MIP)*, and *Generate Depth Report for Large Resources*) are inactive/disabled.
+    *   **Historical File Versions (estimated)**: Ticking *Include Historical File Versions* in Shallow Scan adds an **Estimated File Counts (incl. Versions)** and **Estimated Corpus Size (incl. Versions)**, which are used for the ETA. No extra API calls are made.
+        *   For each Document Library, the ratio `TotalSize / TotalFileStreamSize` from SharePoint storage metrics approximates the average number of versions per file, capped at 180 versions per file (including the current version).
+        *   `File Count`, `Corpus Size` and the >500k Large Resource check still use the current files only.
+        *   These values may not be fully accurate depending on the underlying data distribution. Run a Deep Scan for exact version counts.
 *   **Deep Scan (Toggle Shallow Scan OFF)**:
     *   Switch **Shallow Scan** **OFF** if you need folder depth analysis (`> depth limit 100`), shortcut counts, file size distribution buckets, Recycle Bin sizing, Historical File Versions sizing, Encrypted File detection, or Depth Reports for Large Resources (`suggested_batches/depth_report.csv`).
     *   **Recommended Workflow**: Run **Shallow Scan** first across your tenant. If any sites, Subsites, or Document Libraries exceed 500k items, Shallow Scan automatically generates a `suggested_batches/DeepScanRecommended.csv` file in the output folder—you can then switch **Shallow Scan** OFF and upload `DeepScanRecommended.csv` to run a Deep Scan only on those large sites.
@@ -375,6 +380,7 @@ The results dashboard displays summary cards for the scanned OneDrive and ShareP
 *   **Failed Document Library Count** *(Shallow Scan)*: Number of Document Libraries that could not be scanned due to access or API errors.
 *   **Folder Count**: Total folders discovered across scanned Document Libraries.
 *   **File Count**: Total files discovered across scanned Document Libraries.
+*   **Estimated Corpus Size (incl. Versions) / Estimated File Counts (incl. Versions)** *(Shallow Scan, when Include Historical File Versions is ticked)*: Estimated size and file count including up to 180 versions per file. These values drive the ETA.
 *   **Shortcut Count**: Total shortcuts identified (*shown as `N/A` in Shallow Scan*).
 *   **List Count**: Total SharePoint lists identified.
 *   **Folder / File count beyond depth limit 100**: Count of folders and files nested deeper than 100 levels (*shown as `N/A` in Shallow Scan*).
@@ -419,7 +425,7 @@ You can also download just the log file via the **"Export logs"** button or the 
 
 Once the scan completes, artifacts are saved under `/outputs/<timestamp>/` and can also be exported to a custom location using the **"Export logs"** and **"Export full report"** buttons in the UI:
 
-1.  **Site Report (`site_report_<timestamp>.csv`)**: Site-by-site breakdown of subsites, Document Libraries (`DL Count` and `Failed DL Count` in Shallow Scan), lists, folders, files, corpus size, threshold count (`>500k`), and `Suggested Batch`.
+1.  **Site Report (`site_report_<timestamp>.csv`)**: Site-by-site breakdown of subsites, Document Libraries (`DL Count` and `Failed DL Count` in Shallow Scan), lists, folders, files, corpus size, threshold count (`>500k`), and `Suggested Batch`. With Shallow Scan version estimates, it also includes `Version Expansion Factor`, `Estimated File Counts (incl. Versions)` and `Estimated Corpus Size (incl. Versions)`; these are reused automatically when the report is uploaded to recalculate ETA.
 2.  **Suggested Batch Files (`suggested_batches/`)**: Individual batch CSV files (`Batch1.csv`, `Batch2.csv`, etc.) ready for migration planning.
 3.  **Sites for Deep Scan (`suggested_batches/DeepScanRecommended.csv`)** *(Shallow Scan, when entities >500k items are detected)*: A ready-to-upload `Entity` CSV containing the URLs of sites that exceeded the 500k item threshold so you can run a targeted Deep Scan on them.
 

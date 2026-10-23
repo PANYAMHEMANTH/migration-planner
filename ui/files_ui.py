@@ -532,6 +532,10 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
     site_metrics = {}
     personal_dl_total = 0
     team_dl_total = 0
+    has_version_cols = {
+        shallow_ui_helpers.EST_FILE_COUNT_COL,
+        shallow_ui_helpers.EST_CORPUS_SIZE_COL,
+    }.issubset(df.columns)
     
     for _, row in df.iterrows():
       site_id = str(row[id_col]).strip()
@@ -572,6 +576,13 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
           "totalSize": _parse_size_str(row.get("Corpus Size", 0)),
           "resourceCount": res_cnt,
       }
+      if has_version_cols:
+        site_metrics[site_id]["estimatedMigratableFileCount"] = max(
+            0, _safe_int(row.get(shallow_ui_helpers.EST_FILE_COUNT_COL), default=file_cnt)
+        )
+        site_metrics[site_id]["estimatedMigratableSize"] = max(
+            0.0, _parse_size_str(row.get(shallow_ui_helpers.EST_CORPUS_SIZE_COL, 0))
+        )
 
     self.skipped_actual_scan = True
     dl_total = personal_dl_total + team_dl_total
@@ -610,6 +621,13 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
         "licenseMetrics": {},
         "tenantLevelFileSizeDistribution": {},
         "tenantLevelLargeResources": [],
+        "hasVersionEstimates": has_version_cols,
+        "estimatedMigratableFileCount": sum(
+            s.get("estimatedMigratableFileCount", 0) for s in site_metrics.values()
+        ),
+        "estimatedMigratableSize": sum(
+            s.get("estimatedMigratableSize", 0) for s in site_metrics.values()
+        ),
     }
 
   def _get_input_from_csv_if_uploaded(self, config):
@@ -761,6 +779,7 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
           file_metrics.get("isShallowScan")
           or getattr(self, "val_shallow_scan", False)
       )
+      has_version_estimates = shallow_ui_helpers.has_version_estimates(file_metrics)
       site_data = []
       for site_id, s_data in site_metrics.items():
         row_data = {
@@ -784,9 +803,11 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
         if getattr(self, "val_include_recycle_bin_contents", False):
             row_data["Recycle Bin Item Count"] = s_data.get("recycleBinCount", 0)
             row_data["Recycle Bin Size"] = s_data.get("recycleBinSize", 0)
-        if getattr(self, "val_include_file_versions", False):
+        if getattr(self, "val_include_file_versions", False) and not is_shallow_mode:
             row_data["Historical File Version Count"] = s_data.get("versionCount", 0)
             row_data["Historical File Version Size"] = s_data.get("versionSize", 0)
+        if has_version_estimates:
+            shallow_ui_helpers.add_version_estimate_columns(row_data, s_data)
         if getattr(self, "val_scan_encrypted_files", False):
             row_data["Encrypted File Count"] = s_data.get("encryptedFileCount", 0)
             row_data["Encrypted File Size"] = s_data.get("encryptedFileSize", 0)
@@ -878,6 +899,8 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
         df_output["Recycle Bin Size"] = df_output["Recycle Bin Size"].apply(self.format_size)
       if "Historical File Version Size" in df_output.columns:
         df_output["Historical File Version Size"] = df_output["Historical File Version Size"].apply(self.format_size)
+      if shallow_ui_helpers.EST_CORPUS_SIZE_COL in df_output.columns:
+        df_output[shallow_ui_helpers.EST_CORPUS_SIZE_COL] = df_output[shallow_ui_helpers.EST_CORPUS_SIZE_COL].apply(self.format_size)
       if "Encrypted File Size" in df_output.columns:
         df_output["Encrypted File Size"] = df_output["Encrypted File Size"].apply(self.format_size)
       df_output.rename(columns={"Site Id": "Site URL/Name"}, inplace=True)
@@ -993,12 +1016,26 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
     else:
       df["Corpus Size"] = pd.to_numeric(df["Corpus Size"], errors="coerce").fillna(0)
 
-    df["SortMetric"] = df.apply(
-      lambda x: max(
-          (x["Corpus Size"] / FILES_GLOBAL_CORPUS_SIZE_LIMIT), (x["Resource Count"] / FILES_GLOBAL_COUNT_LIMIT)
-      ),
-      axis=1,
-    )
+    # Shallow Scan version estimates, when present, drive ordering and ETA.
+    eta_size_col, eta_file_col = shallow_ui_helpers.resolve_eta_columns(df)
+    sort_resource = df["Resource Count"]
+    if eta_file_col != "File Count":
+      df[eta_size_col] = pd.to_numeric(df[eta_size_col], errors="coerce").fillna(0)
+      df[eta_file_col] = pd.to_numeric(df[eta_file_col], errors="coerce").fillna(0)
+      active_files = (
+          pd.to_numeric(df["File Count"], errors="coerce").fillna(0)
+          if "File Count" in df.columns
+          else 0
+      )
+      sort_resource = sort_resource + (df[eta_file_col] - active_files).clip(lower=0)
+
+    df["SortMetric"] = pd.concat(
+        [
+            df[eta_size_col] / FILES_GLOBAL_CORPUS_SIZE_LIMIT,
+            sort_resource / FILES_GLOBAL_COUNT_LIMIT,
+        ],
+        axis=1,
+    ).max(axis=1)
     # 1. Sort Sites (Descending - Heaviest first)
     df_sorted_base = df.sort_values(by="SortMetric", ascending=False).copy()
 
@@ -1059,8 +1096,8 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
     sorted_rows = [row for _, row in df_sorted_base.iterrows()]
     site_etas = [
         _eta_from_totals(
-            row.get("Corpus Size", 0),
-            int(row.get("File Count", 0)),
+            row.get(eta_size_col, 0),
+            int(row.get(eta_file_col, 0)),
             int(row.get("Encrypted File Count", 0)) if has_enc_files else 0,
             float(row.get("Encrypted File Size", 0)) if has_enc_size else 0.0,
         )
@@ -1095,8 +1132,8 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
         )
 
         lane_rows = [r for _, r in lane_df.iterrows()]
-        sizes_list = [r.get("Corpus Size", 0) for r in lane_rows]
-        files_list = [int(r.get("File Count", 0)) for r in lane_rows]
+        sizes_list = [r.get(eta_size_col, 0) for r in lane_rows]
+        files_list = [int(r.get(eta_file_col, 0)) for r in lane_rows]
         enc_files_list = (
             [int(r.get("Encrypted File Count", 0)) for r in lane_rows]
             if has_enc_files
@@ -1328,11 +1365,13 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
 
       include_recycle = getattr(self, "val_include_recycle_bin_contents", False)
       include_versions = getattr(self, "val_include_file_versions", False)
+      is_shallow_results = bool(data.get("isShallowScan") or getattr(self, "val_shallow_scan", False))
+      has_version_estimates = shallow_ui_helpers.has_version_estimates(data)
 
       note_parts = []
       if include_recycle:
           note_parts.append("Recycle Bin contents")
-      if include_versions:
+      if include_versions and not is_shallow_results:
           note_parts.append("Historical File Versions")
 
       if note_parts:
@@ -1367,9 +1406,11 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
       if getattr(self, "val_include_recycle_bin_contents", False):
         self.create_stat_card(card_frame, "Total Recycle Bin Size", f"{self.format_size(sum([entry.get('recycleBinSize', 0) for entry in data.get('siteMetrics', {}).values()]))}", "🗑️")
         self.create_stat_card(card_frame, "Total Recycle Bin Item Count", f"{sum([entry.get('recycleBinCount', 0) for entry in data.get('siteMetrics', {}).values()]):,}", "🗑️")
-      if getattr(self, "val_include_file_versions", False):
+      if getattr(self, "val_include_file_versions", False) and not is_shallow_results:
         self.create_stat_card(card_frame, "Total Historical File Version Size", f"{self.format_size(sum([entry.get('versionSize', 0) for entry in data.get('siteMetrics', {}).values()]))}", "📄")
         self.create_stat_card(card_frame, "Total Historical File Version Count", f"{sum([entry.get('versionCount', 0) for entry in data.get('siteMetrics', {}).values()]):,}", "📄")
+      if has_version_estimates:
+        self.create_stat_card(card_frame, "Estimated Corpus Size\n(incl. Versions)", f"{self.format_size(sum([entry.get('estimatedMigratableSize', 0) for entry in data.get('siteMetrics', {}).values()]))}", "🏢")
       self.create_stat_card(card_frame, "Site Collection\nCount", f"{data.get('siteCount'):,}", "🏢")
       self.create_stat_card(card_frame, "Subsite Count", f"{data.get('subsiteCount'):,}", "🏢")
       self.create_stat_card(card_frame, "Document\nLibrary Count", f"{sum(data.get('driveCounts', {}).values()):,}", "📁")
@@ -1394,6 +1435,8 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
         file_count = sum(int(s.get("fileCount", 0) or 0) for s in data["siteMetrics"].values())
       self.create_stat_card(card_frame, "Folder Count", f"{folder_count:,}", "📁")
       self.create_stat_card(card_frame, "File Count", f"{file_count:,}", "📄")
+      if has_version_estimates:
+        self.create_stat_card(card_frame, "Estimated File Counts\n(incl. Versions)", f"{sum([int(entry.get('estimatedMigratableFileCount', 0) or 0) for entry in data.get('siteMetrics', {}).values()]):,}", "📄")
       if getattr(self, "val_scan_encrypted_files", False):
         self.create_stat_card(card_frame, "Total Encrypted\nFile Count", f"{sum([entry.get('encryptedFileCount', 0) for entry in data.get('siteMetrics', {}).values()]):,}", "🔒")
         self.create_stat_card(card_frame, "Total Encrypted\nFile Size", f"{self.format_size(sum([entry.get('encryptedFileSize', 0) for entry in data.get('siteMetrics', {}).values()]))}", "🔒")
@@ -1764,21 +1807,30 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
       writer.writerow(["Summary Metrics", "Value"])
       include_recycle = getattr(self, "val_include_recycle_bin_contents", False)
       include_versions = getattr(self, "val_include_file_versions", False)
+      is_shallow_export = bool(
+          data.get("isShallowScan") or getattr(self, "val_shallow_scan", False)
+      )
+      has_version_estimates = shallow_ui_helpers.has_version_estimates(data)
 
       note_parts = []
       if include_recycle:
           note_parts.append("Recycle Bin contents")
-      if include_versions:
+      if include_versions and not is_shallow_export:
           note_parts.append("Historical File Versions")
 
       if note_parts:
           note_text = f"Note: {' and '.join(note_parts)} are accounted for in Corpus Size calculations but will not be migrated."
           writer.writerow([note_text])
+      if has_version_estimates:
+          writer.writerow([shallow_ui_helpers.VERSION_ESTIMATE_NOTE])
       
       total_corpus_size = sum([entry.get('totalSize', 0) for entry in data.get('siteMetrics', {}).values()])
       summary_rows = [
           ("Total Corpus Size", self.format_size(total_corpus_size)),
       ]
+      if has_version_estimates:
+          total_est_size = sum([entry.get('estimatedMigratableSize', 0) for entry in data.get('siteMetrics', {}).values()])
+          summary_rows.append((shallow_ui_helpers.EST_CORPUS_SIZE_COL, self.format_size(total_est_size)))
       if getattr(self, "val_include_recycle_bin_contents", False):
           total_recycle_bin_size = sum([entry.get('recycleBinSize', 0) for entry in data.get('siteMetrics', {}).values()])
           total_recycle_bin_count = sum([entry.get('recycleBinCount', 0) for entry in data.get('siteMetrics', {}).values()])
@@ -1786,7 +1838,7 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
               ("Total Recycle Bin Size", self.format_size(total_recycle_bin_size)),
               ("Total Recycle Bin Item Count", total_recycle_bin_count),
           ])
-      if getattr(self, "val_include_file_versions", False):
+      if getattr(self, "val_include_file_versions", False) and not is_shallow_export:
           total_version_size = sum([entry.get('versionSize', 0) for entry in data.get('siteMetrics', {}).values()])
           total_version_count = sum([entry.get('versionCount', 0) for entry in data.get('siteMetrics', {}).values()])
           summary_rows.extend([
@@ -1801,9 +1853,6 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
               ("Total Encrypted File Count", total_encrypted_count),
           ])
       
-      is_shallow_export = bool(
-          data.get("isShallowScan") or getattr(self, "val_shallow_scan", False)
-      )
       summary_rows.extend([
           ("Site Collection Count", data.get("siteCount", 0)),
           ("Subsite Count", data.get("subsiteCount", 0)),
@@ -1831,6 +1880,10 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
           ("Large Resource Count (Entities with >500k items)", data.get("tenantLevelLargeResourceCount", 0)),
           ("Total Scan Runtime", data.get("total_runtime", "N/A"))
       ])
+      if has_version_estimates:
+          file_count_idx = next(i for i, (label, _) in enumerate(summary_rows) if label == "File Count")
+          total_est_files = sum([int(entry.get('estimatedMigratableFileCount', 0) or 0) for entry in data.get('siteMetrics', {}).values()])
+          summary_rows.insert(file_count_idx + 1, (shallow_ui_helpers.EST_FILE_COUNT_COL, total_est_files))
       
       for label, val in summary_rows:
           writer.writerow([label, val])
@@ -1889,8 +1942,15 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
         if getattr(self, "val_include_recycle_bin_contents", False):
           row.extend(["Recycle Bin Item Count", "Recycle Bin Size"])
 
-        if getattr(self, "val_include_file_versions", False):
+        if getattr(self, "val_include_file_versions", False) and not is_shallow_export:
           row.extend(["Historical File Version Count", "Historical File Version Size"])
+
+        if has_version_estimates:
+          row.extend([
+              shallow_ui_helpers.VERSION_FACTOR_COL,
+              shallow_ui_helpers.EST_FILE_COUNT_COL,
+              shallow_ui_helpers.EST_CORPUS_SIZE_COL,
+          ])
 
         if getattr(self, "val_scan_encrypted_files", False):
           row.extend(["Encrypted File Count", "Encrypted File Size"])
@@ -1976,10 +2036,19 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
                   self.format_size(s_data.get("recycleBinSize", 0))
               ])
 
-            if getattr(self, "val_include_file_versions", False):
+            if getattr(self, "val_include_file_versions", False) and not is_shallow_export:
               row.extend([
                   s_data.get("versionCount", 0),
                   self.format_size(s_data.get("versionSize", 0))
+              ])
+
+            if has_version_estimates:
+              est_cols = {}
+              shallow_ui_helpers.add_version_estimate_columns(est_cols, s_data)
+              row.extend([
+                  est_cols[shallow_ui_helpers.VERSION_FACTOR_COL],
+                  est_cols[shallow_ui_helpers.EST_FILE_COUNT_COL],
+                  self.format_size(est_cols[shallow_ui_helpers.EST_CORPUS_SIZE_COL]),
               ])
 
             if getattr(self, "val_scan_encrypted_files", False):
@@ -2047,7 +2116,7 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
     self.val_parallel_batches = self.parallel_batches.get()
     self.val_eta_max_batches = self.eta_max_batches.get()
 
-    if self.val_include_file_versions:
+    if self.val_include_file_versions and not self.val_shallow_scan:
         warning_msg = (
             "Enabling 'Include Historical File Versions in Corpus Size' will cause severe performance degradation "
             "as it requires fetching versions for every single file. "
