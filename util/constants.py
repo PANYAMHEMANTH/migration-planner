@@ -82,6 +82,27 @@ FILES_GLOBAL_COUNT_LIMIT = 4  # 4 files/folders per second
 FILES_GLOBAL_CORPUS_SIZE_LIMIT = (400 * 1024 * 1024 * 1024) // 3600  # 400 GB per hour in bytes per second
 ENCRYPTED_FILE_ETA_MULTIPLIER = 0.5 # 0.5x speed for encrypted files
 MAX_MIGRATED_VERSIONS_PER_FILE = 180 # Max versions migrated per file, including the current version
+# Observed files/sec per migration batch by tenant license count: (max licenses, files/sec).
+FILES_BATCH_RATE_TIERS = (
+    (1000, 6.2),
+    (5000, 12.5),
+    (15000, 18.7),
+    (50000, 20.8),
+    (float("inf"), 22.3),
+)
+FILES_BATCH_RATE_BUFFER = 0.8 # Use 80% of the observed per-batch rate (20% buffer)
+# Batching: a batch's largest sites should be similar in file count so they finish together.
+SITE_SIMILARITY_MIN_K = 7 # At least this many of a batch's largest sites should be similar in size
+SITE_SIMILARITY_MAX_K = 10 # A batch's group of similar largest sites grows up to this many
+SITE_SIMILARITY_MAX_RATIO = 1.5 # Largest site <= this x the K-th largest site (by file count)
+SITE_SIMILARITY_NEAR_MISS_RATIO = 3.0 # Short groups are topped up to K if they stay within this ratio
+SITE_SIMILARITY_MIN_FILES = 1000 # Sites below this file count are never treated as giant sites
+FILES_MAX_SITES_PER_BATCH = 5000 # Hard limit on sites in one batch
+BATCH_TARGET_TOLERANCE = 1.15 # A batch's head stops growing above this x the target batch time
+BATCH_PLAN_ETA_TOLERANCE = 0.001 # Plans within 0.1% of the best total ETA count as equally fast
+# Site report columns holding Shallow Scan version-inclusive estimates.
+EST_FILE_COUNT_COL = "Estimated File Counts (incl. Versions)"
+EST_CORPUS_SIZE_COL = "Estimated Corpus Size (incl. Versions)"
 
 ENABLE_CALENDAR_ETA = False
 ETA_CALENDAR_GLOBAL_LIMIT = 50

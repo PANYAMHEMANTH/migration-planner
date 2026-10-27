@@ -40,6 +40,8 @@ from util.constants import (
     COLOR_TONAL_BG,
     COLOR_TONAL_HOVER,
     COLOR_TONAL_TEXT,
+    EST_CORPUS_SIZE_COL,
+    EST_FILE_COUNT_COL,
     FONT_BODY_BOLD,
     FONT_BODY_MEDIUM,
     FONT_BODY_SMALL,
@@ -49,12 +51,11 @@ from util.constants import (
     MAX_MIGRATED_VERSIONS_PER_FILE,
 )
 from util.files_shallow.cert_token_manager import CertTokenManager
+from batching import files_batching
 
 logger = logging.getLogger(__name__)
 
 VERSION_FACTOR_COL = "Version Expansion Factor"
-EST_FILE_COUNT_COL = "Estimated File Counts (incl. Versions)"
-EST_CORPUS_SIZE_COL = "Estimated Corpus Size (incl. Versions)"
 VERSION_ESTIMATE_NOTE = (
     f"Note: Estimated values (incl. versions) include up to {MAX_MIGRATED_VERSIONS_PER_FILE}"
     " versions per file, approximated from storage metrics, and may not be"
@@ -85,17 +86,6 @@ def add_version_estimate_columns(row_data: dict, s_data: dict) -> None:
   row_data[EST_CORPUS_SIZE_COL] = s_data.get(
       "estimatedMigratableSize", s_data.get("totalSize", 0)
   )
-
-
-def resolve_eta_columns(df: pd.DataFrame):
-  """Returns the (size, file count) columns the ETA should use.
-
-  Version-inclusive estimates are used when present; otherwise the active-only
-  'Corpus Size' and 'File Count' columns.
-  """
-  if EST_CORPUS_SIZE_COL in df.columns and EST_FILE_COUNT_COL in df.columns:
-    return EST_CORPUS_SIZE_COL, EST_FILE_COUNT_COL
-  return "Corpus Size", "File Count"
 
 
 def build_shallow_scan_toggle(tool, ctk):
@@ -650,59 +640,9 @@ def run_certificate_auth_check(tool, config, ctk) -> bool:
 
 
 def calculate_batches_with_shallow_exclusions(tool, df: pd.DataFrame, license_metrics: dict):
-  """Excludes sites with >500k items from ETA calculation during Shallow Scan.
-
-  Marks excluded sites with Suggested Batch = 'Deep Scan Recommended' so they
-  are natively exported to outputs/<ts>/suggested_batches/DeepScanRecommended.csv.
-  """
+  """Batches sites, excluding >500k-item sites from ETA during Shallow Scan."""
   if not getattr(tool, "val_shallow_scan", False):
     return tool.calculate_migration_batches(df, license_metrics)
-
-  large_col = "Entities with > 500k item count"
-  if large_col not in df.columns:
-    numeric_large = pd.Series([0] * len(df), index=df.index)
-  else:
-    numeric_large = pd.to_numeric(df[large_col], errors="coerce").fillna(0)
-
-  df_eligible = df[numeric_large == 0].copy()
-  df_excluded = df[numeric_large > 0].copy()
-
-  if not df_excluded.empty:
-    df_excluded["Suggested Batch"] = "Deep Scan Recommended"
-    tool.log_msg(
-        f"[Shallow Scan] Excluding {len(df_excluded)} site(s) with >500k items "
-        "from ETA calculation (marked as 'Deep Scan Recommended')."
-    )
-
-  if not df_eligible.empty:
-    # Convert N/A string columns to 0 temporarily for numeric ETA/batching calculation
-    na_cols = [
-        "Shortcut Count",
-        "Folder Count > Depth Limit 100",
-        "File Count > Depth Limit 100",
-    ]
-    for col in na_cols:
-      if col in df_eligible.columns:
-        df_eligible[col] = pd.to_numeric(
-            df_eligible[col], errors="coerce"
-        ).fillna(0)
-
-    df_eligible_final, batches_list, total_eta, buckets = (
-        tool.calculate_migration_batches(df_eligible, license_metrics)
-    )
-
-    # Restore N/A display values for shallow scan unsupported metrics
-    for col in na_cols:
-      if col in df_eligible_final.columns:
-        df_eligible_final[col] = "N/A"
-    for b in batches_list:
-      b["shortcut_count"] = "N/A"
-    for bucket in buckets:
-      for b in bucket.get("batches", []):
-        b["shortcut_count"] = "N/A"
-  else:
-    df_eligible_final = df_eligible
-    batches_list, total_eta, buckets = [], 0.0, []
-
-  df_combined = pd.concat([df_eligible_final, df_excluded], ignore_index=True)
-  return df_combined, batches_list, total_eta, buckets
+  return files_batching.batch_with_shallow_exclusions(
+      df, license_metrics, tool.calculate_migration_batches, tool.log_msg
+  )

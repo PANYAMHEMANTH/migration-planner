@@ -1452,7 +1452,6 @@ class ShallowVersionEstimateEtaTest(unittest.TestCase):
   """Verifies the ETA reads version-inclusive columns when present."""
 
   def _make_tool(self):
-    from estimators.file_estimator import FileEstimator
     from ui.files_ui import FileMigrationEstimatorTool
 
     tool = object.__new__(FileMigrationEstimatorTool)
@@ -1462,31 +1461,7 @@ class ShallowVersionEstimateEtaTest(unittest.TestCase):
     tool.val_eta_max_batches = 100
     tool.val_include_team_sites = True
     tool.log_msg = lambda *_: None
-    eta_estimator = mock.Mock()
-    eta_estimator.calculate_migration_eta.side_effect = (
-        lambda data: FileEstimator.calculate_migration_eta(None, data)
-    )
-    tool.factory = mock.Mock()
-    tool.factory.get_files_estimator.return_value = eta_estimator
     return tool
-
-  def test_resolve_eta_columns(self):
-    """Verify column selection with and without estimate columns."""
-    import pandas as pd
-    from ui.files_shallow import shallow_ui_helpers
-
-    plain = pd.DataFrame([{"Corpus Size": 1, "File Count": 1}])
-    self.assertEqual(
-        shallow_ui_helpers.resolve_eta_columns(plain), ("Corpus Size", "File Count")
-    )
-    with_est = plain.assign(**{
-        shallow_ui_helpers.EST_FILE_COUNT_COL: 10,
-        shallow_ui_helpers.EST_CORPUS_SIZE_COL: 10,
-    })
-    self.assertEqual(
-        shallow_ui_helpers.resolve_eta_columns(with_est),
-        (shallow_ui_helpers.EST_CORPUS_SIZE_COL, shallow_ui_helpers.EST_FILE_COUNT_COL),
-    )
 
   def test_eta_scales_with_estimated_file_count(self):
     """Verify a 10x estimated file count yields a 10x file-bound ETA."""
@@ -1511,6 +1486,52 @@ class ShallowVersionEstimateEtaTest(unittest.TestCase):
 
     self.assertGreater(eta_active, 0)
     self.assertAlmostEqual(eta_versions / eta_active, 10.0, places=6)
+
+
+class FilesBatchingUiTest(unittest.TestCase):
+  """Verifies the Files UI delegates to the shared batching algorithm."""
+
+  def _make_tool(self):
+    from ui.files_ui import FileMigrationEstimatorTool
+
+    tool = object.__new__(FileMigrationEstimatorTool)
+    tool.val_eta_min_users = 1
+    tool.val_eta_max_users = 1000
+    tool.val_parallel_batches = 2
+    tool.val_eta_max_batches = 100
+    tool.log_msg = lambda *_: None
+    return tool
+
+  def test_deep_and_shallow_reports_use_shared_algorithm(self):
+    """Both report types are batched by files_batching, with the right ETA columns."""
+    import pandas as pd
+    from ui.files_shallow import shallow_ui_helpers
+
+    deep_df = pd.DataFrame([
+        {"Site Id": "a", "File Count": 100, "Resource Count": 100, "Corpus Size": 10},
+    ])
+    shallow_df = deep_df.copy()
+    shallow_df[shallow_ui_helpers.EST_FILE_COUNT_COL] = 300
+    shallow_df[shallow_ui_helpers.EST_CORPUS_SIZE_COL] = 30
+    expected_cols = {
+        id(deep_df): ("Corpus Size", "File Count"),
+        id(shallow_df): (
+            shallow_ui_helpers.EST_CORPUS_SIZE_COL,
+            shallow_ui_helpers.EST_FILE_COUNT_COL,
+        ),
+    }
+    tool = self._make_tool()
+    with mock.patch(
+        "ui.files_ui.files_batching.calculate_files_migration_batches"
+    ) as shared:
+      for df in (deep_df, shallow_df):
+        tool.calculate_migration_batches(df, {})
+        kwargs = shared.call_args.kwargs
+        self.assertIs(shared.call_args.args[0], df)
+        self.assertEqual(
+            (kwargs["eta_size_col"], kwargs["eta_file_col"]), expected_cols[id(df)]
+        )
+        self.assertEqual(kwargs["num_parallel"], 2)
 
 
 class ShallowVersionEstimateCsvTest(unittest.TestCase):
