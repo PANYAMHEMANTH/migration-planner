@@ -389,6 +389,22 @@ The results dashboard displays summary cards for the scanned OneDrive and ShareP
 
 The exported CSV report includes all summary metrics along with granular site-level details (with `Failed DL Count` included right after `DL Count` in Shallow Scan). If both Personal (OneDrive) and SharePoint Sites are scanned, results for both are grouped separately in the full report export.
 
+#### 2. Timeline Estimates & Batching (OneDrive / SharePoint)
+*   **Batch speed**: Each batch migrates at up to 400 GB/hour and at a files/second rate based on the tenant's license count, reduced by 20% as a buffer:
+
+    | Licenses | Files/second per batch (after buffer) |
+    |---|---|
+    | 0 – 1,000 | 4.96 |
+    | 1,001 – 5,000 | 10.00 |
+    | 5,001 – 15,000 | 14.96 |
+    | 15,001 – 50,000 | 16.64 |
+    | 50,000+ | 17.84 |
+*   **Lanes**: The selected number of parallel batches ("lanes") run independently, each running its batches one after another. The **Total ETA** is the duration of the busiest lane. The plan keeps the Total ETA as low as possible; the rules below never make it slower.
+*   **Similar-size largest sites**: In each batch, at least 7 (up to 10) of the largest sites (by file count) are kept within 1.5× of each other, so they finish around the same time and the batch doesn't wait on one large site. Smaller sites fill the rest of the batch. Folders don't count towards ETA or batching.
+*   **Balanced batches**: Sites limited by file count and sites limited by size are mixed in the same batch, so both the files/second and the 400 GB/hour limits are used and batches take a similar time.
+*   **Very large sites**: A site with no similar-size peers (e.g. 1.3M files when the next largest has 560k) leads its own batch with only small sites alongside it. These batches are listed in the log.
+*   **Limits**: A batch never holds more than 5,000 sites, and the maximum number of batches is respected (unless the 5,000-site limit needs more). The minimum sites per batch is followed where it doesn't make the plan slower.
+
 ---
 
 ### Workflow C Results: Microsoft Teams & Chat Planner
