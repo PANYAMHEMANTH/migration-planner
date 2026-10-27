@@ -24,10 +24,40 @@ from urllib.parse import urlparse
 
 from estimators.file_estimator import FileEstimator
 from util.connectors import UrlInvoker
+from util.constants import MAX_MIGRATED_VERSIONS_PER_FILE
 from util.enums import FailureType, ResourceType
 from util.files_shallow.cert_token_manager import CertTokenManager
 from util.files_shallow.sp_rest_connector import SpRestConnector
 from util.utils import ScanConfig
+
+
+def estimate_migratable_versions(
+    file_count: int, active_size: int, total_size: int
+) -> Tuple[float, float, int, int]:
+  """Estimates one library's migratable file count and size, including versions.
+
+  StorageMetrics exposes sizes but not version counts, so the ratio
+  TotalSize / TotalFileStreamSize is used as a proxy for the average number of
+  versions per file. A library without versions stays at 1.0x, and the result
+  is capped at the number of versions migrated per file.
+
+  Args:
+    file_count: Number of files in the library.
+    active_size: TotalFileStreamSize, the size of current file versions.
+    total_size: TotalSize, the size including version history and metadata.
+
+  Returns:
+    Tuple of (raw_ratio, factor, estimated_file_count, estimated_size_bytes).
+  """
+  active_size = max(0, active_size)
+  total_size = max(0, total_size)
+  raw_ratio = max(1.0, total_size / active_size) if active_size > 0 else 1.0
+  factor = min(raw_ratio, float(MAX_MIGRATED_VERSIONS_PER_FILE))
+  estimated_file_count = int(round(max(0, file_count) * factor))
+  estimated_size = max(
+      active_size, min(total_size, active_size * MAX_MIGRATED_VERSIONS_PER_FILE)
+  )
+  return raw_ratio, factor, estimated_file_count, estimated_size
 
 
 @dataclass(frozen=True)
@@ -106,6 +136,9 @@ class ShallowFileEstimator(FileEstimator):
         "tenantLevelFileSizeDistribution": {"buckets": []},
         "tenantLevelLargeResources": [],
         "tenantLevelLargeResourceCount": 0,
+        "hasVersionEstimates": bool(self.config.include_file_versions),
+        "estimatedMigratableFileCount": 0,
+        "estimatedMigratableSize": 0,
     }
 
   def _prepare_root_sites(self, metrics: Dict[str, Any]) -> None:
@@ -129,6 +162,9 @@ class ShallowFileEstimator(FileEstimator):
       s_data.setdefault("largeResourceCount", 0)
       s_data.setdefault("totalSize", 0)
       s_data.setdefault("resourceCount", 0)
+      if self.config.include_file_versions:
+        s_data.setdefault("estimatedMigratableFileCount", 0)
+        s_data.setdefault("estimatedMigratableSize", 0)
 
   def _build_library_targets(
       self,
@@ -383,6 +419,21 @@ class ShallowFileEstimator(FileEstimator):
       active_size_bytes = library_metrics["active_size_bytes"]
       resource_cnt = max(item_cnt, folder_cnt + file_cnt)
 
+      include_versions = self.config.include_file_versions
+      if include_versions:
+        raw_ratio, factor, est_file_cnt, est_size_bytes = (
+            estimate_migratable_versions(
+                file_cnt,
+                active_size_bytes,
+                library_metrics.get("total_size_bytes", 0),
+            )
+        )
+        self.logger(
+            f"[Shallow Scan] Version estimate for {target.library_url}: raw "
+            f"ratio {raw_ratio:.2f}x, applied factor {factor:.2f}x "
+            f"({file_cnt:,} -> {est_file_cnt:,} files)"
+        )
+
       with lock:
         s_meta = metrics["siteMetrics"][target.top_level_site_id]
         s_meta["fileCount"] += file_cnt
@@ -400,6 +451,19 @@ class ShallowFileEstimator(FileEstimator):
             "resourceCount": resource_cnt,
             "totalSize": active_size_bytes,
         }
+
+        if include_versions:
+          s_meta["estimatedMigratableFileCount"] = (
+              s_meta.get("estimatedMigratableFileCount", 0) + est_file_cnt
+          )
+          s_meta["estimatedMigratableSize"] = (
+              s_meta.get("estimatedMigratableSize", 0) + est_size_bytes
+          )
+          metrics["driveMetrics"][target.drive_id].update({
+              "versionExpansionFactor": factor,
+              "estimatedMigratableFileCount": est_file_cnt,
+              "estimatedMigratableSize": est_size_bytes,
+          })
 
         self._flag_threshold_breaches(
             metrics,
@@ -441,6 +505,15 @@ class ShallowFileEstimator(FileEstimator):
       failed_count: int,
   ) -> None:
     """Aggregates tenant-level totals and fires completion UI events."""
+    if metrics.get("hasVersionEstimates"):
+      metrics["estimatedMigratableFileCount"] = sum(
+          int(s.get("estimatedMigratableFileCount", 0) or 0)
+          for s in metrics["siteMetrics"].values()
+      )
+      metrics["estimatedMigratableSize"] = sum(
+          int(s.get("estimatedMigratableSize", 0) or 0)
+          for s in metrics["siteMetrics"].values()
+      )
     metrics["folderCount"] = sum(
         int(s.get("folderCount", 0) or 0)
         for s in metrics["siteMetrics"].values()

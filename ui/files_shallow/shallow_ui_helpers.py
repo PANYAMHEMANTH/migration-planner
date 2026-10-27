@@ -16,6 +16,7 @@
 
 import logging
 import threading
+import tkinter as tk
 from tkinter import messagebox
 from urllib.parse import urlparse
 import pandas as pd
@@ -45,10 +46,21 @@ from util.constants import (
     FONT_HEADER_MEDIUM,
     FONT_HEADER_SMALL,
     GRAPH_BASE_URL,
+    MAX_MIGRATED_VERSIONS_PER_FILE,
 )
 from util.files_shallow.cert_token_manager import CertTokenManager
 
 logger = logging.getLogger(__name__)
+
+VERSION_FACTOR_COL = "Version Expansion Factor"
+EST_FILE_COUNT_COL = "Estimated File Counts (incl. Versions)"
+EST_CORPUS_SIZE_COL = "Estimated Corpus Size (incl. Versions)"
+VERSION_ESTIMATE_NOTE = (
+    f"Note: Estimated values (incl. versions) include up to {MAX_MIGRATED_VERSIONS_PER_FILE}"
+    " versions per file, approximated from storage metrics, and may not be"
+    " fully accurate depending on the underlying data distribution. Run a Deep"
+    " Scan for exact version counts."
+)
 
 
 def format_stat_value(val) -> str:
@@ -56,6 +68,34 @@ def format_stat_value(val) -> str:
   if isinstance(val, (int, float)) and not isinstance(val, bool):
     return f"{int(val):,}"
   return str(val)
+
+
+def has_version_estimates(data: dict) -> bool:
+  """Returns True if the metrics contain Shallow Scan version estimates."""
+  return bool(data.get("hasVersionEstimates"))
+
+
+def add_version_estimate_columns(row_data: dict, s_data: dict) -> None:
+  """Adds the version estimate columns for one site to a site table row."""
+  file_cnt = int(s_data.get("fileCount", 0) or 0)
+  est_file_cnt = int(s_data.get("estimatedMigratableFileCount", file_cnt) or 0)
+  factor = est_file_cnt / file_cnt if file_cnt > 0 else 1.0
+  row_data[VERSION_FACTOR_COL] = round(factor, 2)
+  row_data[EST_FILE_COUNT_COL] = est_file_cnt
+  row_data[EST_CORPUS_SIZE_COL] = s_data.get(
+      "estimatedMigratableSize", s_data.get("totalSize", 0)
+  )
+
+
+def resolve_eta_columns(df: pd.DataFrame):
+  """Returns the (size, file count) columns the ETA should use.
+
+  Version-inclusive estimates are used when present; otherwise the active-only
+  'Corpus Size' and 'File Count' columns.
+  """
+  if EST_CORPUS_SIZE_COL in df.columns and EST_FILE_COUNT_COL in df.columns:
+    return EST_CORPUS_SIZE_COL, EST_FILE_COUNT_COL
+  return "Corpus Size", "File Count"
 
 
 def build_shallow_scan_toggle(tool, ctk):
@@ -89,6 +129,8 @@ def on_shallow_scan_toggle(tool):
 
   Shallow Scan reads aggregate StorageMetrics and ItemCounts only, so settings
   that require per-file requests or a folder tree are cleared and disabled.
+  'Include Historical File Versions' stays available: Shallow Scan estimates
+  versions from StorageMetrics without extra requests.
   Source selection is left untouched: OneDrive, SharePoint, or both are all
   supported, since every document library is scanned through the same
   per-library REST path.
@@ -97,7 +139,6 @@ def on_shallow_scan_toggle(tool):
 
   additional_checkboxes = [
       (tool.include_recycle_bin_contents, getattr(tool, "cb_recycle_bin", None)),
-      (tool.include_file_versions, getattr(tool, "cb_file_versions", None)),
       (tool.scan_encrypted_files, getattr(tool, "cb_encrypted_files", None)),
       (tool.generate_folder_amr_map, getattr(tool, "cb_depth_report", None)),
   ]
@@ -414,6 +455,18 @@ def ensure_certificates_and_prompt(tool, config, ctk) -> bool:
   return True
 
 
+THROTTLED_DETAIL_PREFIX = "Throttled by Microsoft"
+
+
+def _throttled_detail(resp, service: str) -> str:
+  """Builds a throttling diagnostic, including the server's Retry-After."""
+  retry_after = resp.headers.get("Retry-After", "unknown")
+  return (
+      f"{THROTTLED_DETAIL_PREFIX}: {service} returned HTTP {resp.status_code}"
+      f" (Retry-After: {retry_after}s): {resp.text}"
+  )
+
+
 def validate_certificate_auth(config, current_logger=None) -> tuple[bool, str]:
   """Verifies that certificate-based SharePoint REST authentication works.
 
@@ -422,11 +475,16 @@ def validate_certificate_auth(config, current_logger=None) -> tuple[bool, str]:
   2. Acquires a certificate-signed token for that domain for every app.
   3. Calls the SharePoint REST root web endpoint with each token.
 
+  Every request is attempted once (retries=0). A retrying session would
+  silently honour Retry-After on HTTP 429, which Microsoft can set to several
+  minutes, leaving the progress dialog stuck. Throttling is reported instead.
+
   This function performs no UI work and is safe to run on a worker thread.
 
   Returns:
     Tuple of (success, detail). On success, detail is the SharePoint domain.
-    On failure, detail is a diagnostic message intended for logs only.
+    On failure, detail is a diagnostic message intended for logs only; it
+    starts with THROTTLED_DETAIL_PREFIX when Microsoft throttled the check.
   """
   try:
     with TokenManager(
@@ -434,7 +492,7 @@ def validate_certificate_auth(config, current_logger=None) -> tuple[bool, str]:
         client_ids=config.client_ids,
         client_secrets=config.client_secrets,
         concurrency=1,
-        retries=config.retries,
+        retries=0,
         backoff=config.backoff,
     ) as graph_manager:
       graph_manager.authenticate_all(current_logger)
@@ -444,6 +502,8 @@ def validate_certificate_auth(config, current_logger=None) -> tuple[bool, str]:
           headers={"Authorization": f"Bearer {graph_token['token']}"},
           timeout=30.0,
       )
+      if resp.status_code in (429, 503):
+        return False, _throttled_detail(resp, "Microsoft Graph")
       if resp.status_code != 200:
         return False, (
             f"Unable to resolve SharePoint root site (HTTP {resp.status_code}):"
@@ -476,6 +536,8 @@ def validate_certificate_auth(config, current_logger=None) -> tuple[bool, str]:
             },
             timeout=30.0,
         )
+        if resp.status_code in (429, 503):
+          return False, _throttled_detail(resp, "SharePoint")
         if resp.status_code != 200:
           return False, (
               "SharePoint REST check failed for App"
@@ -560,16 +622,28 @@ def run_certificate_auth_check(tool, config, ctk) -> bool:
     logger.error(f"Certificate authentication check failed: {detail}")
     tool.log_msg(f"Certificate authentication check failed: {detail}")
 
-    retry = messagebox.askretrycancel(
-        title="Certificate Authentication Failed",
-        message=(
-            "Certificate authentication is not working. Please check that you"
-            " have uploaded the certificate and that your credentials are"
-            " correct."
-        ),
-        icon="warning",
-        parent=tool,
-    )
+    if detail.startswith(THROTTLED_DETAIL_PREFIX):
+      title = "Microsoft Is Throttling Requests"
+      message = (
+          "Microsoft is temporarily limiting requests for this tenant, so the"
+          " certificate check could not complete. Please wait a few minutes"
+          " and retry."
+      )
+    else:
+      title = "Certificate Authentication Failed"
+      message = (
+          "Certificate authentication is not working. Please check that you"
+          " have uploaded the certificate and that your credentials are"
+          " correct."
+      )
+
+    try:
+      retry = messagebox.askretrycancel(
+          title=title, message=message, icon="warning", parent=tool
+      )
+    except tk.TclError:
+      # The main window was closed while the check was running.
+      return False
     if not retry:
       logger.info("Certificate authentication check cancelled by user.")
       return False

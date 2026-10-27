@@ -428,7 +428,7 @@ class ShallowScanBaseTest(unittest.TestCase):
         return {"ItemCount": data["item"]}
       if isinstance(data.get("storage"), BaseException):
         raise data["storage"]
-      return storage_body(data["files"], data["size"])
+      return storage_body(data["files"], data["size"], data.get("total"))
 
     targets = self.estimator._build_library_targets(
         metrics, subsite_to_drives, subsite_to_top_level_site, failures
@@ -1224,7 +1224,8 @@ class ShallowScanReportCsvUploadTest(unittest.TestCase):
     tool.cb_encrypted_files = DummyWidget()
     tool.cb_depth_report = DummyWidget()
 
-    # Pre-set vars to True to confirm on_shallow_scan_toggle resets them to False and disables widgets
+    # Pre-set vars to True to confirm on_shallow_scan_toggle resets Deep-only
+    # settings to False and disables their widgets.
     tool.include_recycle_bin_contents.set(True)
     tool.include_file_versions.set(True)
     tool.scan_encrypted_files.set(True)
@@ -1234,7 +1235,6 @@ class ShallowScanReportCsvUploadTest(unittest.TestCase):
 
     for var in (
         tool.include_recycle_bin_contents,
-        tool.include_file_versions,
         tool.scan_encrypted_files,
         tool.generate_folder_amr_map,
     ):
@@ -1242,11 +1242,15 @@ class ShallowScanReportCsvUploadTest(unittest.TestCase):
 
     for widget in (
         tool.cb_recycle_bin,
-        tool.cb_file_versions,
         tool.cb_encrypted_files,
         tool.cb_depth_report,
     ):
       self.assertEqual(widget.state, "disabled")
+
+    # File versions are estimated from StorageMetrics in Shallow Scan, so the
+    # setting stays available and keeps its value.
+    self.assertTrue(tool.include_file_versions.get())
+    self.assertEqual(tool.cb_file_versions.state, "normal")
 
   def test_shallow_scan_site_report_csv_upload_with_failed_dl_count(self):
     """Verify Shallow Scan site_report.csv with 'Failed DL Count' column validates and parses failedDlCount."""
@@ -1341,6 +1345,224 @@ class ShallowDeepScanRecommendedTest(unittest.TestCase):
     self.assertEqual(df_final["Suggested Batch"].iloc[0], "Batch 1")
 
 
+class ShallowVersionEstimateFormulaTest(unittest.TestCase):
+  """Verifies the per-library version expansion maths."""
+
+  def test_estimate_cases(self):
+    """Verify factor, file count and size across normal and edge inputs."""
+    from estimators.files_shallow.shallow_file_estimator import estimate_migratable_versions
+
+    # (name, files, active, total, exp_raw, exp_factor, exp_files, exp_size)
+    cases = [
+        ("no_versions", 100, 1000, 1000, 1.0, 1.0, 100, 1000),
+        ("metadata_overhead_only", 100, 1000, 1020, 1.02, 1.02, 102, 1020),
+        ("typical_history", 100, 1000, 3000, 3.0, 3.0, 300, 3000),
+        ("just_below_cap", 10, 1000, 179000, 179.0, 179.0, 1790, 179000),
+        ("exactly_at_cap", 10, 1000, 180000, 180.0, 180.0, 1800, 180000),
+        ("just_above_cap", 10, 1000, 181000, 181.0, 180.0, 1800, 180000),
+        ("far_above_cap_size_limited", 100, 1000, 500000, 500.0, 180.0, 18000, 180000),
+        ("no_active_bytes", 100, 0, 5000, 1.0, 1.0, 100, 0),
+        ("total_below_active_clamped", 100, 1000, 900, 1.0, 1.0, 100, 1000),
+        ("total_missing", 100, 1000, 0, 1.0, 1.0, 100, 1000),
+    ]
+    for name, files, active, total, raw, factor, est_files, est_size in cases:
+      with self.subTest(case=name):
+        out = estimate_migratable_versions(files, active, total)
+        self.assertAlmostEqual(out[0], raw, places=6)
+        self.assertAlmostEqual(out[1], factor, places=6)
+        self.assertEqual(out[2], est_files)
+        self.assertEqual(out[3], est_size)
+
+
+class ShallowVersionEstimateScanTest(ShallowScanBaseTest):
+  """Verifies version estimates are rolled up per library during Shallow Scan."""
+
+  def _enable_versions(self):
+    self.estimator.config.include_file_versions = True
+
+  def test_disabled_by_default_leaves_metrics_unchanged(self):
+    """Verify no estimate fields are produced when the setting is off."""
+    site = self.register_site("siteA", f"{TENANT}/sites/Finance")
+    d1 = self.register_library("d1", f"{TENANT}/sites/Finance/Shared%20Documents")
+    metrics = self.build_metrics([site])
+
+    out = self.run_scan(
+        metrics, {site: [d1]}, {},
+        {d1: {"item": 120, "files": 100, "size": 1000, "total": 3000}},
+    )
+
+    self.assertFalse(out["metrics"]["hasVersionEstimates"])
+    site_metrics = out["metrics"]["siteMetrics"][site]
+    self.assertNotIn("estimatedMigratableFileCount", site_metrics)
+    self.assertNotIn("estimatedMigratableSize", site_metrics)
+    self.assertNotIn("versionExpansionFactor", out["metrics"]["driveMetrics"][d1])
+
+  def test_factor_is_applied_per_library(self):
+    """Verify a versioned library doesn't inflate an unversioned sibling."""
+    self._enable_versions()
+    site = self.register_site("siteA", f"{TENANT}/sites/Finance")
+    d1 = self.register_library("d1", f"{TENANT}/sites/Finance/Shared%20Documents")
+    d2 = self.register_library("d2", f"{TENANT}/sites/Finance/SiteAssets")
+    metrics = self.build_metrics([site])
+
+    out = self.run_scan(
+        metrics, {site: [d1, d2]}, {},
+        {
+            d1: {"item": 120, "files": 100, "size": 1000, "total": 3000},
+            d2: {"item": 60, "files": 50, "size": 500, "total": 500},
+        },
+    )
+
+    m = out["metrics"]
+    self.assertTrue(m["hasVersionEstimates"])
+    site_metrics = m["siteMetrics"][site]
+    # Active-only values are unchanged.
+    self.assertEqual(site_metrics["fileCount"], 150)
+    self.assertEqual(site_metrics["totalSize"], 1500)
+    # d1: 100 x 3.0 = 300; d2: 50 x 1.0 = 50.
+    self.assertEqual(site_metrics["estimatedMigratableFileCount"], 350)
+    self.assertEqual(site_metrics["estimatedMigratableSize"], 3500)
+    self.assertAlmostEqual(m["driveMetrics"][d1]["versionExpansionFactor"], 3.0)
+    self.assertAlmostEqual(m["driveMetrics"][d2]["versionExpansionFactor"], 1.0)
+    self.assertEqual(m["estimatedMigratableFileCount"], 350)
+    self.assertEqual(m["estimatedMigratableSize"], 3500)
+
+  def test_large_resource_check_ignores_version_expansion(self):
+    """Verify the >500k check stays on actual item counts."""
+    self._enable_versions()
+    site = self.register_site("siteA", f"{TENANT}/sites/Finance")
+    d1 = self.register_library("d1", f"{TENANT}/sites/Finance/Shared%20Documents")
+    metrics = self.build_metrics([site])
+
+    # 400 actual items (< LARGE_LIMIT) but 10x after expansion.
+    out = self.run_scan(
+        metrics, {site: [d1]}, {},
+        {d1: {"item": 400, "files": 400, "size": 100, "total": 1000}},
+    )
+
+    self.assertGreater(
+        out["metrics"]["siteMetrics"][site]["estimatedMigratableFileCount"],
+        LARGE_LIMIT,
+    )
+    self.assertEqual(out["metrics"]["tenantLevelLargeResourceCount"], 0)
+    self.assertEqual(out["metrics"]["siteMetrics"][site]["largeResourceCount"], 0)
+
+
+class ShallowVersionEstimateEtaTest(unittest.TestCase):
+  """Verifies the ETA reads version-inclusive columns when present."""
+
+  def _make_tool(self):
+    from estimators.file_estimator import FileEstimator
+    from ui.files_ui import FileMigrationEstimatorTool
+
+    tool = object.__new__(FileMigrationEstimatorTool)
+    tool.val_eta_min_users = 1
+    tool.val_eta_max_users = 1000
+    tool.val_parallel_batches = 1
+    tool.val_eta_max_batches = 100
+    tool.val_include_team_sites = True
+    tool.log_msg = lambda *_: None
+    eta_estimator = mock.Mock()
+    eta_estimator.calculate_migration_eta.side_effect = (
+        lambda data: FileEstimator.calculate_migration_eta(None, data)
+    )
+    tool.factory = mock.Mock()
+    tool.factory.get_files_estimator.return_value = eta_estimator
+    return tool
+
+  def test_resolve_eta_columns(self):
+    """Verify column selection with and without estimate columns."""
+    import pandas as pd
+    from ui.files_shallow import shallow_ui_helpers
+
+    plain = pd.DataFrame([{"Corpus Size": 1, "File Count": 1}])
+    self.assertEqual(
+        shallow_ui_helpers.resolve_eta_columns(plain), ("Corpus Size", "File Count")
+    )
+    with_est = plain.assign(**{
+        shallow_ui_helpers.EST_FILE_COUNT_COL: 10,
+        shallow_ui_helpers.EST_CORPUS_SIZE_COL: 10,
+    })
+    self.assertEqual(
+        shallow_ui_helpers.resolve_eta_columns(with_est),
+        (shallow_ui_helpers.EST_CORPUS_SIZE_COL, shallow_ui_helpers.EST_FILE_COUNT_COL),
+    )
+
+  def test_eta_scales_with_estimated_file_count(self):
+    """Verify a 10x estimated file count yields a 10x file-bound ETA."""
+    import pandas as pd
+    from ui.files_shallow import shallow_ui_helpers
+
+    base_row = {
+        "Site Id": "siteA", "File Count": 3520, "Folder Count": 0,
+        "Resource Count": 3520, "Corpus Size": 1024 * 1024,
+    }
+    _, _, eta_active, _ = self._make_tool().calculate_migration_batches(
+        pd.DataFrame([base_row]), {}
+    )
+    est_row = dict(base_row, **{
+        shallow_ui_helpers.VERSION_FACTOR_COL: 10.0,
+        shallow_ui_helpers.EST_FILE_COUNT_COL: 35200,
+        shallow_ui_helpers.EST_CORPUS_SIZE_COL: 10 * 1024 * 1024,
+    })
+    _, _, eta_versions, _ = self._make_tool().calculate_migration_batches(
+        pd.DataFrame([est_row]), {}
+    )
+
+    self.assertGreater(eta_active, 0)
+    self.assertAlmostEqual(eta_versions / eta_active, 10.0, places=6)
+
+
+class ShallowVersionEstimateCsvTest(unittest.TestCase):
+  """Verifies uploaded site reports round-trip the version estimate columns."""
+
+  def _parse(self, csv_content):
+    import os
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as tmp:
+      tmp.write(csv_content)
+      tmp_path = tmp.name
+    try:
+      tool = ShallowScanReportCsvUploadTest._make_dummy_tool(self, tmp_path)
+      config = build_config(user_source="csv", csv_path=tmp_path)
+      return tool._try_get_metrics_from_csv_report(config)
+    finally:
+      os.remove(tmp_path)
+
+  _HEADER = (
+      "Site URL/Name,Subsite Count,DL Count,Failed DL Count,List Count,Folder Count,File Count,"
+      "Shortcut Count,Folder Count > Depth Limit 100,File Count > Depth Limit 100,"
+      "Entities with > 500k item count,Corpus Size"
+  )
+
+  def test_report_with_estimates_is_parsed(self):
+    """Verify estimate columns are read back and totals computed."""
+    metrics = self._parse(
+        self._HEADER + ",Version Expansion Factor,Estimated File Counts (incl. Versions),"
+        "Estimated Corpus Size (incl. Versions),Suggested Batch\n"
+        "https://contoso.sharepoint.com/sites/a,0,1,0,1,10,100,N/A,N/A,N/A,0,1.00 GB,3.4,340,3.00 GB,Batch 1\n"
+        "https://contoso.sharepoint.com/sites/b,0,1,0,1,5,50,N/A,N/A,N/A,0,512.00 MB,1.0,50,512.00 MB,Batch 1\n"
+    )
+
+    self.assertTrue(metrics["hasVersionEstimates"])
+    site_a = metrics["siteMetrics"]["https://contoso.sharepoint.com/sites/a"]
+    self.assertEqual(site_a["estimatedMigratableFileCount"], 340)
+    self.assertAlmostEqual(site_a["estimatedMigratableSize"], 3 * 1024 ** 3)
+    self.assertEqual(metrics["estimatedMigratableFileCount"], 390)
+
+  def test_report_without_estimates_falls_back(self):
+    """Verify older reports parse unchanged with no estimates."""
+    metrics = self._parse(
+        self._HEADER + ",Suggested Batch\n"
+        "https://contoso.sharepoint.com/sites/a,0,1,0,1,10,100,N/A,N/A,N/A,0,1.00 GB,Batch 1\n"
+    )
+
+    self.assertFalse(metrics["hasVersionEstimates"])
+    site_a = metrics["siteMetrics"]["https://contoso.sharepoint.com/sites/a"]
+    self.assertNotIn("estimatedMigratableFileCount", site_a)
+
+
 class ShallowFailedDlTrackingTest(ShallowScanBaseTest):
   """Tests per-site and tenant-wide failedDlCount tracking when a DL REST call fails."""
 
@@ -1398,6 +1620,7 @@ class ValidateCertificateAuthTest(unittest.TestCase):
       def __init__(self, **kwargs):
         self.session = test._FakeSession({"sites/root": graph_resp})
         test.graph_session = self.session
+        test.graph_kwargs = kwargs
 
       def __enter__(self):
         return self
@@ -1481,6 +1704,31 @@ class ValidateCertificateAuthTest(unittest.TestCase):
     self.assertFalse(ok)
     self.assertIn("HTTP 403", detail)
     self.assertFalse(hasattr(self, "sp_session"))
+
+  def test_graph_throttling_is_reported_without_retrying(self):
+    """A Graph 429 must fail fast with a throttling detail, not block on Retry-After."""
+    from ui.files_shallow import shallow_ui_helpers
+
+    ok, detail = self._run(
+        MockResponse(429, {}, text="activityLimitReached", headers={"Retry-After": "300"}),
+        MockResponse(200, {"Title": "Root"}),
+    )
+    self.assertFalse(ok)
+    self.assertTrue(detail.startswith(shallow_ui_helpers.THROTTLED_DETAIL_PREFIX))
+    self.assertIn("Retry-After: 300", detail)
+    self.assertEqual(self.graph_kwargs["retries"], 0)
+    self.assertFalse(hasattr(self, "sp_session"))
+
+  def test_sharepoint_throttling_is_reported(self):
+    """A SharePoint 429 is reported as throttling, not a certificate problem."""
+    from ui.files_shallow import shallow_ui_helpers
+
+    ok, detail = self._run(
+        MockResponse(200, {"webUrl": "https://contoso.sharepoint.com"}),
+        MockResponse(429, {}, text="Throttled", headers={"Retry-After": "120"}),
+    )
+    self.assertFalse(ok)
+    self.assertTrue(detail.startswith(shallow_ui_helpers.THROTTLED_DETAIL_PREFIX))
 
 
 if __name__ == "__main__":
