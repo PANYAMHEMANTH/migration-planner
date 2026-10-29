@@ -516,18 +516,16 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
         "Folder Count > Depth Limit 100",
         "File Count > Depth Limit 100",
     ]
+    # Detection is based on CSV content only and drives display (N/A columns,
+    # Failed DL Count). ETA exclusions follow the Shallow Scan toggle instead.
     is_shallow_report = (
-        getattr(self, "val_shallow_scan", False)
-        or "Failed DL Count" in df.columns
+        "Failed DL Count" in df.columns
         or any(
             df[col].astype(str).str.strip().str.upper().str.startswith("N/A").any()
             for col in na_cols
             if col in df.columns
         )
     )
-    if is_shallow_report:
-      self.val_shallow_scan = True
-      config.shallow_scan = True
 
     site_metrics = {}
     personal_dl_total = 0
@@ -757,10 +755,7 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
         file_metrics["failedDlCount"] = sum(
             int(s.get("failedDlCount", 0) or 0) for s in site_metrics.values()
         )
-      is_shallow_mode = bool(
-          file_metrics.get("isShallowScan")
-          or getattr(self, "val_shallow_scan", False)
-      )
+      is_shallow_mode = bool(file_metrics.get("isShallowScan"))
       site_data = []
       for site_id, s_data in site_metrics.items():
         row_data = {
@@ -1344,13 +1339,8 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
               text_color=COLOR_TEXT_MAIN,
           ).pack(anchor="w", padx=10, pady=(0, 10))
 
-      if data.get("isShallowScan") and data.get("tenantLevelLargeResourceCount", 0) > 0:
-          large_entity_count = data.get("tenantLevelLargeResourceCount", 0)
-          entity_label = "entity contains" if large_entity_count == 1 else "entities contain"
-          rec_text = (
-              f"⚠️ {large_entity_count:,} {entity_label} items >500k. Sites containing these entities were excluded from ETA calculations.\n"
-              "Recommendation: Run a Deep Scan with 'Generate Depth Report for Large Resources' enabled on these resources using the exported 'DeepScanRecommended.csv' in suggested_batches."
-          )
+      rec_text = shallow_ui_helpers.get_large_resource_banner_text(self, data)
+      if rec_text:
           ctk.CTkLabel(
               self.view_results,
               text=rec_text,
@@ -1373,7 +1363,7 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
       self.create_stat_card(card_frame, "Site Collection\nCount", f"{data.get('siteCount'):,}", "🏢")
       self.create_stat_card(card_frame, "Subsite Count", f"{data.get('subsiteCount'):,}", "🏢")
       self.create_stat_card(card_frame, "Document\nLibrary Count", f"{sum(data.get('driveCounts', {}).values()):,}", "📁")
-      if data.get("isShallowScan") or getattr(self, "val_shallow_scan", False):
+      if data.get("isShallowScan"):
         failed_dl_count = data.get("failedDlCount", 0)
         if not failed_dl_count and data.get("siteMetrics"):
           failed_dl_count = sum(
@@ -1801,9 +1791,7 @@ class FileMigrationEstimatorTool(MigrationEstimatorTool):
               ("Total Encrypted File Count", total_encrypted_count),
           ])
       
-      is_shallow_export = bool(
-          data.get("isShallowScan") or getattr(self, "val_shallow_scan", False)
-      )
+      is_shallow_export = bool(data.get("isShallowScan"))
       summary_rows.extend([
           ("Site Collection Count", data.get("siteCount", 0)),
           ("Subsite Count", data.get("subsiteCount", 0)),

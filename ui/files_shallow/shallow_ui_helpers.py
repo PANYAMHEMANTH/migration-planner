@@ -575,14 +575,113 @@ def run_certificate_auth_check(tool, config, ctk) -> bool:
       return False
 
 
+SHALLOW_NA_COLS = [
+    "Shortcut Count",
+    "Folder Count > Depth Limit 100",
+    "File Count > Depth Limit 100",
+]
+
+
+def _calculate_batches_with_na_columns(tool, df: pd.DataFrame, license_metrics: dict):
+  """Runs batch calculation, temporarily treating 'N/A' metric columns as 0.
+
+  Only columns that actually contain 'N/A' values (e.g. from a Shallow Scan or
+  an uploaded Shallow Scan site report) are coerced and restored afterwards, so
+  real Deep Scan values are preserved for display.
+  """
+  df = df.copy()
+  na_cols = [
+      col
+      for col in SHALLOW_NA_COLS
+      if col in df.columns
+      and df[col].astype(str).str.strip().str.upper().str.startswith("N/A").any()
+  ]
+  for col in na_cols:
+    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+  df_final, batches_list, total_eta, buckets = tool.calculate_migration_batches(
+      df, license_metrics
+  )
+
+  # Restore N/A display values for metrics unsupported by Shallow Scan
+  for col in na_cols:
+    if col in df_final.columns:
+      df_final[col] = "N/A"
+  if "Shortcut Count" in na_cols:
+    for b in batches_list:
+      b["shortcut_count"] = "N/A"
+    for bucket in buckets:
+      for b in bucket.get("batches", []):
+        b["shortcut_count"] = "N/A"
+
+  return df_final, batches_list, total_eta, buckets
+
+
+def get_large_resource_banner_text(tool, data: dict):
+  """Returns the Shallow Scan banner describing how >500k sites affected the ETA.
+
+  Live API scans keep the original banner. For uploaded site reports (ETA
+  recalculation only), the banner follows the Shallow Scan toggle and always
+  states whether >500k sites were excluded. Returns None when Shallow Scan is
+  off (Deep Scan ETA shows no banner) or when there is nothing to report.
+  """
+  large_entity_count = int(data.get("tenantLevelLargeResourceCount", 0) or 0)
+  entity_label = "entity contains" if large_entity_count == 1 else "entities contain"
+
+  if not getattr(tool, "skipped_actual_scan", False):
+    if data.get("isShallowScan") and large_entity_count > 0:
+      return (
+          f"⚠️ {large_entity_count:,} {entity_label} items >500k. Sites containing these entities were excluded from ETA calculations.\n"
+          "Recommendation: Run a Deep Scan with 'Generate Depth Report for Large Resources' enabled on these resources using the exported 'DeepScanRecommended.csv' in suggested_batches."
+      )
+    return None
+
+  is_shallow = getattr(tool, "val_shallow_scan", False)
+  if not is_shallow:
+    return None
+
+  show_eta = getattr(tool, "show_eta", True)
+
+  df = data.get("df")
+  if df is not None and "Suggested Batch" in df.columns:
+    excluded_site_count = int((df["Suggested Batch"] == "Deep Scan Recommended").sum())
+  else:
+    # No plan DataFrame (e.g. ETA hidden): Shallow Scan still marks every large site.
+    excluded_site_count = sum(
+        1
+        for s in data.get("siteMetrics", {}).values()
+        if int(pd.to_numeric(s.get("largeResourceCount", 0), errors="coerce") or 0) > 0
+    )
+
+  if excluded_site_count > 0:
+    site_label = "site" if excluded_site_count == 1 else "sites"
+    verb = "was" if excluded_site_count == 1 else "were"
+    return (
+        f"⚠️ {large_entity_count:,} {entity_label} items >500k. {excluded_site_count:,} {site_label}"
+        f" containing these entities {verb} excluded from ETA calculations.\n"
+        "Recommendation: Run a Deep Scan with 'Generate Depth Report for Large Resources' enabled on"
+        " these resources using the exported 'DeepScanRecommended.csv' in suggested_batches."
+    )
+  if show_eta:
+    return (
+        "ℹ️ Shallow Scan: No entities with >500k items found. All sites are included in ETA"
+        " calculations."
+    )
+  return None
+
+
 def calculate_batches_with_shallow_exclusions(tool, df: pd.DataFrame, license_metrics: dict):
   """Excludes sites with >500k items from ETA calculation during Shallow Scan.
+
+  Exclusion is driven solely by the Shallow Scan toggle. When the toggle is off,
+  every site (including ones with >500k-item entities) is planned like a Deep
+  Scan, even if the data came from an uploaded Shallow Scan site report.
 
   Marks excluded sites with Suggested Batch = 'Deep Scan Recommended' so they
   are natively exported to outputs/<ts>/suggested_batches/DeepScanRecommended.csv.
   """
   if not getattr(tool, "val_shallow_scan", False):
-    return tool.calculate_migration_batches(df, license_metrics)
+    return _calculate_batches_with_na_columns(tool, df, license_metrics)
 
   large_col = "Entities with > 500k item count"
   if large_col not in df.columns:
@@ -601,31 +700,9 @@ def calculate_batches_with_shallow_exclusions(tool, df: pd.DataFrame, license_me
     )
 
   if not df_eligible.empty:
-    # Convert N/A string columns to 0 temporarily for numeric ETA/batching calculation
-    na_cols = [
-        "Shortcut Count",
-        "Folder Count > Depth Limit 100",
-        "File Count > Depth Limit 100",
-    ]
-    for col in na_cols:
-      if col in df_eligible.columns:
-        df_eligible[col] = pd.to_numeric(
-            df_eligible[col], errors="coerce"
-        ).fillna(0)
-
     df_eligible_final, batches_list, total_eta, buckets = (
-        tool.calculate_migration_batches(df_eligible, license_metrics)
+        _calculate_batches_with_na_columns(tool, df_eligible, license_metrics)
     )
-
-    # Restore N/A display values for shallow scan unsupported metrics
-    for col in na_cols:
-      if col in df_eligible_final.columns:
-        df_eligible_final[col] = "N/A"
-    for b in batches_list:
-      b["shortcut_count"] = "N/A"
-    for bucket in buckets:
-      for b in bucket.get("batches", []):
-        b["shortcut_count"] = "N/A"
   else:
     df_eligible_final = df_eligible
     batches_list, total_eta, buckets = [], 0.0, []

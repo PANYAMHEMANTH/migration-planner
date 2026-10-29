@@ -1164,12 +1164,13 @@ class ShallowScanReportCsvUploadTest(unittest.TestCase):
         tool._validate_csv()
         mock_err.assert_not_called()
 
-      # 2. _try_get_metrics_from_csv_report must parse N/A safely and auto-enable shallow scan mode
+      # 2. _try_get_metrics_from_csv_report must parse N/A safely and flag the report as shallow
+      #    for display, without overriding the Shallow Scan toggle (which drives ETA exclusions)
       metrics = tool._try_get_metrics_from_csv_report(config)
       self.assertIsNotNone(metrics)
       self.assertTrue(metrics["isShallowScan"])
-      self.assertTrue(tool.val_shallow_scan)
-      self.assertTrue(config.shallow_scan)
+      self.assertFalse(tool.val_shallow_scan)
+      self.assertFalse(config.shallow_scan)
       self.assertTrue(tool.skipped_actual_scan)
 
       self.assertEqual(metrics["siteCount"], 3)
@@ -1288,15 +1289,45 @@ class ShallowScanReportCsvUploadTest(unittest.TestCase):
       if os.path.exists(tmp_path):
         os.remove(tmp_path)
 
+  def test_deep_scan_site_report_csv_with_toggle_on_keeps_deep_values(self):
+    """Verify a Deep Scan site_report.csv uploaded with the toggle ON keeps real Shortcut/Depth values."""
+    import os
+    import tempfile
+
+    csv_content = (
+        "Site URL/Name,Subsite Count,DL Count,List Count,Folder Count,File Count,"
+        "Shortcut Count,Folder Count > Depth Limit 100,File Count > Depth Limit 100,"
+        "Entities with > 500k item count,Corpus Size,Suggested Batch\n"
+        "https://smh3v.sharepoint.com/sites/marketing,1,5,6,200,17540,7,3,4,1,540.93 GB,Batch 1\n"
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, encoding="utf-8") as tmp:
+      tmp.write(csv_content)
+      tmp_path = tmp.name
+
+    try:
+      tool = self._make_dummy_tool(tmp_path, shallow_toggle=True)
+      config = build_config(user_source="csv", csv_path=tmp_path)
+
+      metrics = tool._try_get_metrics_from_csv_report(config)
+      self.assertIsNotNone(metrics)
+      self.assertFalse(metrics["isShallowScan"])
+      self.assertTrue(tool.val_shallow_scan)
+      self.assertEqual(metrics["shortcutCount"], 7)
+      self.assertEqual(metrics["folderCountExceedingDepthLimit"], 3)
+      self.assertEqual(metrics["fileCountExceedingDepthLimit"], 4)
+    finally:
+      if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+
 
 class ShallowDeepScanRecommendedTest(unittest.TestCase):
   """Verifies only sites with >500k-item entities are marked 'Deep Scan Recommended'."""
 
-  def _make_tool(self):
+  def _make_tool(self, shallow_toggle: bool = True):
     import pandas as pd
 
     tool = mock.Mock()
-    tool.val_shallow_scan = True
+    tool.val_shallow_scan = shallow_toggle
     tool.calculate_migration_batches.side_effect = (
         lambda df, _lm: (df.assign(**{"Suggested Batch": "Batch 1"}), [], 0.0, [])
     )
@@ -1339,6 +1370,138 @@ class ShallowDeepScanRecommendedTest(unittest.TestCase):
     )
 
     self.assertEqual(df_final["Suggested Batch"].iloc[0], "Batch 1")
+
+  def test_toggle_off_plans_large_resource_sites_like_deep_scan(self):
+    """With the toggle OFF, >500k sites from a shallow report are planned, and N/A columns are restored."""
+    from ui.files_shallow import shallow_ui_helpers
+
+    tool, pd = self._make_tool(shallow_toggle=False)
+    df = pd.DataFrame([
+        {"Site Id": "large", "Shortcut Count": "N/A", "Entities with > 500k item count": 2},
+        {"Site Id": "small", "Shortcut Count": "N/A", "Entities with > 500k item count": 0},
+    ])
+
+    df_final, _, _, _ = shallow_ui_helpers.calculate_batches_with_shallow_exclusions(
+        tool, df, {}
+    )
+
+    batches = dict(zip(df_final["Site Id"], df_final["Suggested Batch"]))
+    self.assertEqual(batches, {"large": "Batch 1", "small": "Batch 1"})
+    planned_df = tool.calculate_migration_batches.call_args[0][0]
+    self.assertEqual(sorted(planned_df["Site Id"]), ["large", "small"])
+    self.assertEqual(planned_df["Shortcut Count"].tolist(), [0, 0])
+    self.assertEqual(df_final["Shortcut Count"].tolist(), ["N/A", "N/A"])
+    tool.log_msg.assert_not_called()
+
+  def test_toggle_on_keeps_real_deep_scan_values(self):
+    """With the toggle ON, numeric Shortcut/Depth values from a deep report are not forced to N/A."""
+    from ui.files_shallow import shallow_ui_helpers
+
+    tool, pd = self._make_tool(shallow_toggle=True)
+    df = pd.DataFrame([
+        {"Site Id": "large", "Shortcut Count": 5, "Entities with > 500k item count": 1},
+        {"Site Id": "small", "Shortcut Count": 7, "Entities with > 500k item count": 0},
+    ])
+
+    df_final, _, _, _ = shallow_ui_helpers.calculate_batches_with_shallow_exclusions(
+        tool, df, {}
+    )
+
+    shortcuts = dict(zip(df_final["Site Id"], df_final["Shortcut Count"]))
+    batches = dict(zip(df_final["Site Id"], df_final["Suggested Batch"]))
+    self.assertEqual(shortcuts, {"large": 5, "small": 7})
+    self.assertEqual(batches["large"], "Deep Scan Recommended")
+    self.assertEqual(batches["small"], "Batch 1")
+
+  def _banner(self, shallow_toggle, df_batches, large_counts, show_eta=True,
+              report_upload=True, is_shallow_scan=None):
+    import pandas as pd
+    from ui.files_shallow import shallow_ui_helpers
+
+    tool = mock.Mock()
+    tool.val_shallow_scan = shallow_toggle
+    tool.show_eta = show_eta
+    tool.skipped_actual_scan = report_upload
+    data = {
+        "isShallowScan": shallow_toggle if is_shallow_scan is None else is_shallow_scan,
+        "tenantLevelLargeResourceCount": sum(large_counts),
+        "siteMetrics": {
+            f"s{i}": {"largeResourceCount": c} for i, c in enumerate(large_counts)
+        },
+    }
+    if df_batches is not None:
+      data["df"] = pd.DataFrame({"Suggested Batch": df_batches})
+    return shallow_ui_helpers.get_large_resource_banner_text(tool, data)
+
+  def test_live_shallow_scan_batch_output_unchanged(self):
+    """Live Shallow Scan rows (all N/A) still get N/A columns and N/A batch shortcut counts."""
+    import pandas as pd
+    from ui.files_shallow import shallow_ui_helpers
+
+    tool = mock.Mock()
+    tool.val_shallow_scan = True
+    batch = {"shortcut_count": 0}
+    tool.calculate_migration_batches.side_effect = lambda df, _lm: (
+        df.assign(**{"Suggested Batch": "Batch 1"}), [batch], 1.0, [{"batches": [batch]}]
+    )
+    na_row = {col: "N/A" for col in shallow_ui_helpers.SHALLOW_NA_COLS}
+    df = pd.DataFrame([
+        {"Site Id": "a", **na_row, "Entities with > 500k item count": 0},
+        {"Site Id": "b", **na_row, "Entities with > 500k item count": 1},
+    ])
+
+    df_final, batches, total_eta, _ = shallow_ui_helpers.calculate_batches_with_shallow_exclusions(
+        tool, df, {}
+    )
+
+    for col in shallow_ui_helpers.SHALLOW_NA_COLS:
+      self.assertEqual(df_final[col].tolist(), ["N/A", "N/A"])
+    self.assertEqual(batches[0]["shortcut_count"], "N/A")
+    self.assertEqual(total_eta, 1.0)
+    self.assertEqual(
+        dict(zip(df_final["Site Id"], df_final["Suggested Batch"])),
+        {"a": "Batch 1", "b": "Deep Scan Recommended"},
+    )
+
+  def test_banner_live_shallow_scan_keeps_original_text(self):
+    """Live Shallow Scan with >500k entities keeps the original banner text."""
+    text = self._banner(True, ["Deep Scan Recommended", "Batch 1"], [2, 0], report_upload=False)
+    self.assertEqual(
+        text,
+        "⚠️ 2 entities contain items >500k. Sites containing these entities were excluded from ETA calculations.\n"
+        "Recommendation: Run a Deep Scan with 'Generate Depth Report for Large Resources' enabled on these resources using the exported 'DeepScanRecommended.csv' in suggested_batches.",
+    )
+
+  def test_banner_live_shallow_scan_without_large_sites_shows_nothing(self):
+    """Live Shallow Scan with no >500k entities shows no banner (original behavior)."""
+    self.assertIsNone(self._banner(True, ["Batch 1"], [0], report_upload=False))
+
+  def test_banner_live_deep_scan_shows_nothing(self):
+    """Live Deep Scan shows no banner even with >500k entities (original behavior)."""
+    self.assertIsNone(self._banner(False, ["Batch 1"], [2], report_upload=False))
+
+  def test_banner_toggle_on_with_exclusions(self):
+    """Toggle ON with excluded sites shows the exclusion warning."""
+    text = self._banner(True, ["Deep Scan Recommended", "Batch 1"], [2, 0])
+    self.assertIn("1 site containing these entities was excluded", text)
+
+  def test_banner_toggle_on_without_large_sites(self):
+    """Toggle ON with no >500k sites confirms all sites are included."""
+    text = self._banner(True, ["Batch 1", "Batch 1"], [0, 0])
+    self.assertIn("No entities with >500k items found", text)
+
+  def test_banner_toggle_off_with_large_sites(self):
+    """Toggle OFF (Deep Scan ETA) shows no banner even with >500k sites."""
+    self.assertIsNone(self._banner(False, ["Batch 1", "Batch 2"], [2, 0]))
+
+  def test_banner_toggle_off_without_large_sites(self):
+    """Toggle OFF with no >500k sites shows no banner."""
+    self.assertIsNone(self._banner(False, ["Batch 1"], [0]))
+
+  def test_banner_toggle_on_eta_hidden(self):
+    """Toggle ON with ETA hidden still warns about large sites."""
+    text = self._banner(True, None, [2, 0], show_eta=False)
+    self.assertIn("1 site containing these entities was excluded from ETA calculations", text)
 
 
 class ShallowFailedDlTrackingTest(ShallowScanBaseTest):
